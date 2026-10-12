@@ -1,0 +1,21 @@
+{
+    "name": "websocket-ping-pong-demo",
+    "version": "1.0.0",
+    "description": "Viec 2 - Tuan 2: Chay thu giao tiep WebSocket (ping-pong) giua server va client",
+    "main": "server.js",
+    "scripts": {
+        "server": "node server.js",
+        "client": "node client.js"
+    },
+    "dependencies": {
+        "bcryptjs": "^3.0.3",
+        "cors": "^2.8.6",
+        "dotenv": "^17.4.2",
+        "express": "^4.19.2",
+        "jsonwebtoken": "^9.0.3",
+        "multer": "^2.4.0",
+        "pg": "^8.23.0",
+        "socket.io": "^4.7.5",
+        "socket.io-client": "^4.7.5"
+    }
+}

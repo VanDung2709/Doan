@@ -1,0 +1,45 @@
+======================================================================
+WEEK 8 - PHUC - PHAN TICH GRAD-CAM / DUNG-SAI - V14
+======================================================================
+Correct examples: 7
+Wrong examples  : 7
+Correct conf avg: 0.617
+Correct conf min: 0.340
+Correct conf max: 0.948
+Wrong conf avg  : 0.782
+Wrong conf min  : 0.702
+Wrong conf max  : 0.900
+
+CAC VI DU DUNG:
+- angry -> angry | conf=0.834
+- disgust -> disgust | conf=0.340
+- fear -> fear | conf=0.400
+- happy -> happy | conf=0.541
+- neutral -> neutral | conf=0.563
+- sad -> sad | conf=0.690
+- surprise -> surprise | conf=0.948
+
+CAC VI DU SAI:
+- angry -> surprise | conf=0.753
+- disgust -> angry | conf=0.744
+- fear -> surprise | conf=0.789
+- happy -> surprise | conf=0.900
+- neutral -> sad | conf=0.702
+- sad -> angry | conf=0.807
+- surprise -> angry | conf=0.776
+
+CAC CAP NHAM:
+- angry -> surprise: 1
+- disgust -> angry: 1
+- fear -> surprise: 1
+- happy -> surprise: 1
+- neutral -> sad: 1
+- sad -> angry: 1
+- surprise -> angry: 1
+
+NHAN XET:
+- Confidence cao khong dam bao du doan dung.
+- FER chi nen la tin hieu ho tro trong V14.
+- Grad-CAM chi ho tro giai thich vung anh anh huong den du doan.
+- Khong dung FER/Grad-CAM de chan doan tam ly.
+- Can ket hop FER + Engagement + hanh vi + thoi gian trong Fusion V14.

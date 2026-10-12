@@ -1,0 +1,8 @@
+Test Loss: 0.9455
+Test Accuracy: 0.4640 (46.40%)
+
+Class	Precision	Recall	F1-score
+0-Very Low	0.0000	0.0000	0.0000
+1-Low	0.1495	0.1524	0.1509
+2-High	0.5096	0.4562	0.4815
+3-Very High	0.4540	0.5069	0.4790

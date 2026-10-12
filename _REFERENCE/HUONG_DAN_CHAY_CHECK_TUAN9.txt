@@ -1,0 +1,184 @@
+KLCN313 - TUAN 9 - BO CODE DE CHAY VA CHECK
+==============================================
+
+MUC TIEU:
+- Dang nhap / dang xuat / JWT
+- Phan quyen Admin / Teacher
+- Doi mat khau
+- Admin tao tai khoan giao vien va doi quyen
+- Quan ly lop: xem / them / sua / xoa
+- Quan ly hoc sinh: xem / them / sua / xoa
+- Camera / Realtime theo Track ID
+- Canh bao va lich su AI
+- Bao cao / thong ke 7 ngay - 30 ngay
+- Xuat CSV canh bao
+- Grad-CAM hien tren Web
+- Video: upload / phat / xoa / phan tich V14 / xem ket qua
+- Socket.IO realtime AI / alert / video status
+- Khong dem frame thanh so hoc sinh; dung DISTINCT Track ID moi nhat.
+
+================================================
+A. CHEP FILE
+================================================
+
+1) BACKEND
+
+Copy:
+    BACKEND\Backend_Week9_Complete.js
+    BACKEND\Week9_VideoAnalyzer_V14.py
+
+vao:
+    D:\Doan\
+
+Khong xoa file Week 8 cu. Nen giu lai de rollback.
+
+2) FRONTEND
+
+Copy:
+    FRONTEND\src\App.jsx
+    FRONTEND\src\index.css
+
+vao:
+    D:\Doan\dashboard-week9\src\
+
+ghi de App.jsx va index.css hien tai.
+
+================================================
+B. CAI PACKAGE THEM
+================================================
+
+Terminal Backend:
+
+    cd D:\Doan
+    npm install multer
+
+Terminal React:
+
+    cd D:\Doan\dashboard-week9
+    npm install socket.io-client
+
+Chi can cai mot lan.
+
+================================================
+C. CAC FILE / MODEL CAN CO SAN O D:\Doan
+================================================
+
+Can co:
+    .env
+    yolov8n.pt
+    face_landmarker.task
+    pose_landmarker_lite.task
+    mobilenetv2_fer2013_final.keras
+
+Va model Engagement V14 dang dung:
+    Week7_Baseline\mobilenetv2_daisee_engagement_baseline.keras
+hoac:
+    mobilenetv2_daisee_engagement_official_final.keras
+
+Grad-CAM:
+    D:\Doan\Week8_GradCAM_FER_V14\
+        gradcam_examples.csv
+        correct\...
+        wrong\...
+
+Khong dua .env vao file nop bai vi co mat khau / secret.
+
+================================================
+D. CHAY HE THONG
+================================================
+
+Terminal 1 - Backend Week 9:
+
+    cd D:\Doan
+    node Backend_Week9_Complete.js
+
+Ket qua mong doi:
+    [DB] Khoi tao database thanh cong.
+    [SERVER] Backend Week 9: http://localhost:3001
+    [SERVER] Dashboard + JWT + Socket.IO + Video + Grad-CAM san sang.
+
+Terminal 2 - React:
+
+    cd D:\Doan\dashboard-week9
+    npm run dev
+
+Mo:
+    http://localhost:5173
+
+Dang nhap bang ADMIN_EMAIL / ADMIN_PASSWORD trong D:\Doan\.env.
+
+================================================
+E. TEST TUNG CHUC NANG
+================================================
+
+1. Tong quan
+- Lop / hoc sinh: lay tu PostgreSQL.
+- Mat tap trung / dau hieu lo au: lay trang thai moi nhat cua DISTINCT Track ID.
+- Backend / PostgreSQL: trang thai that qua /api/health.
+- Camera AI: chi hien "Dang chay" neu co AI camera gui du lieu gan day.
+
+2. Phan quyen
+- Admin: duoc them/sua/xoa lop, hoc sinh, tao tai khoan, doi quyen, xoa video.
+- Teacher: xem du lieu, khong duoc thao tac admin.
+- Trang Tai khoan co doi mat khau.
+
+3. Camera / Realtime
+Giu Backend Week 9 dang chay.
+Mo terminal khac va chay ban V14 gui Backend ma nhom da test:
+    python Week8_MultiPerson_FusionAI_V14_Backend.py
+
+Dashboard se cap nhat ai_result + alert_created qua Socket.IO.
+
+4. Canh bao
+- Menu "Canh bao" chi hien canh bao.
+- Tong quan chi hien 5 canh bao gan day.
+- "Xem tat ca" chuyen sang trang Canh bao.
+- Co loc Tat ca / Mat tap trung / Dau hieu lo au.
+
+5. Lich su AI
+- Hien detection_results that.
+- Tim theo Track / Fusion / FER / Engagement / video.
+
+6. Bao cao - thong ke
+- 7 ngay / 30 ngay.
+- Canh bao theo ngay.
+- Co nut "Xuat CSV canh bao".
+
+7. Grad-CAM
+Neu Week8_GradCAM_FER_V14 ton tai khi Backend khoi dong:
+- hien overlay anh Grad-CAM.
+- dung/sai.
+- true label -> predicted label.
+- confidence.
+Neu copy thu muc Grad-CAM sau khi Backend da chay thi restart Backend.
+
+8. Video
+- Tai video.
+- Phat video tren Web.
+- Bam "Phan tich bang V14".
+- Backend goi:
+    Week9_VideoAnalyzer_V14.py --source ... --video-id ... --no-display
+- Trang thai:
+    uploaded -> processing -> completed
+hoac:
+    uploaded -> processing -> failed
+- Bam "Xem ket qua" de sang Lich su AI loc theo video.
+
+================================================
+F. LUU Y QUAN TRONG
+================================================
+
+- Track ID la ID tam thoi cua ByteTrack, KHONG phai student_id.
+- He thong chi canh bao "dau hieu lo au", KHONG chan doan tam ly.
+- Grad-CAM la cong cu giai thich vung anh anh huong toi du doan, khong phai bang chung chan doan.
+- Code da duoc kiem tra CU PHAP:
+    Backend Node.js: OK
+    Python Analyzer: OK
+    App.jsx: JSX syntax OK
+- Chua duoc phep goi Tuan 9 "hoan thanh runtime" cho toi khi test thuc tren may:
+    + login
+    + CRUD
+    + V14 realtime
+    + Grad-CAM
+    + upload/phat/analyze video
+    + role Teacher

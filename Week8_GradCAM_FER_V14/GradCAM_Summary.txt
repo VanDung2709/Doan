@@ -1,0 +1,14 @@
+WEEK 8 - GRAD-CAM FER FINE-TUNE - V14 FIXED
+============================================================
+Model: D:\Doan\mobilenetv2_fer2013_final.keras
+Backbone: mobilenetv2_1.00_224
+Feature shape: (7, 7, 1280)
+Scan per class: 200
+Correct examples saved: 7
+Wrong examples saved: 7
+Max diff model vs split forward: 0.00000000
+
+Giai thich:
+- Grad-CAM duoc tinh tren feature map cuoi cua MobileNetV2 fine-tune FER-2013.
+- Heatmap chi ho tro giai thich vung anh anh huong toi du doan; khong chung minh quan he nhan qua.
+- Anh wrong duoc giu lai de phan tich loi, khong loai bo khoi bao cao.

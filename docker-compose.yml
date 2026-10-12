@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: doan_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-student_monitoring}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env first}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - doan_pgdata:/var/lib/postgresql/data
+volumes:
+  doan_pgdata:

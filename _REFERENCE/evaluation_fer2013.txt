@@ -1,0 +1,11 @@
+Test Loss: 1.2650
+Test Accuracy: 0.5290 (52.90%)
+
+Class	Precision	Recall	F1-score
+angry	0.4357	0.3852	0.4089
+disgust	0.2021	0.5315	0.2928
+fear	0.4147	0.2090	0.2779
+happy	0.7696	0.7362	0.7525
+neutral	0.4518	0.6196	0.5226
+sad	0.4437	0.3633	0.3995
+surprise	0.5673	0.7605	0.6499

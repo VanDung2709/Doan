@@ -1,0 +1,60 @@
+
+===== DAISEE ENGAGEMENT CLIP-LEVEL EVALUATION =====
+
+Model:
+D:\Doan\mobilenetv2_daisee_engagement_official_final.keras
+
+Test Frames:
+8920
+
+Test Clips:
+1784
+
+Clip distribution:
+
+0 - Very Low:
+4
+
+1 - Low:
+84
+
+2 - High:
+882
+
+3 - Very High:
+814
+
+Method:
+
+5 frames of one clip
+-> MobileNetV2 probabilities
+-> mean probability
+-> argmax
+-> engagement class
+
+Clip Accuracy:
+0.4877
+
+Clip Accuracy Percent:
+48.77%
+
+Confusion Matrix:
+
+[[  0   1   0   3]
+ [  0  11  19  54]
+ [  0  23 405 454]
+ [  0  44 316 454]]
+
+Classification Report:
+
+              precision    recall  f1-score   support
+
+    Very Low     0.0000    0.0000    0.0000         4
+         Low     0.1392    0.1310    0.1350        84
+        High     0.5473    0.4592    0.4994       882
+   Very High     0.4705    0.5577    0.5104       814
+
+    accuracy                         0.4877      1784
+   macro avg     0.2893    0.2870    0.2862      1784
+weighted avg     0.4918    0.4877    0.4861      1784
+
