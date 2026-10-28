@@ -15,6 +15,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const cameraRecordings = require("./camera_recordings");
+const gradcamReal = require("./gradcam_real");
 
 const app = express();
 const server = http.createServer(app);
@@ -331,6 +332,22 @@ async function initDatabase() {
           started_at TIMESTAMPTZ DEFAULT NOW()
         );
 
+        -- WEEK9_AUTO_VIDEO_DEMO_RUN_V1: For classroom demonstrations ONLY.
+        -- Separate from confirmed track_student_mappings and alerts.student_id.
+        -- A run can have several tracks mapped to the same sample student.
+        CREATE TABLE IF NOT EXISTS video_demo_track_names (
+            analysis_run_id UUID NOT NULL,
+            video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+            class_id INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+            session_id INTEGER NOT NULL REFERENCES class_sessions(id) ON DELETE CASCADE,
+            track_id INTEGER NOT NULL CHECK (track_id >= 0),
+            student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(analysis_run_id, track_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_demo_track_video
+          ON video_demo_track_names(video_id, analysis_run_id);
+
 
     `);
 
@@ -450,28 +467,22 @@ function disconnectUserSockets(userId) {
 }
 
 function normalizeAlertType(fusionStatus) {
-    const status = String(fusionStatus || "")
-        .trim()
-        .toUpperCase();
-
-    if (
-        status === "DAU HIEU MAT TAP TRUNG"
-        || status === "DAU_HIEU_MAT_TAP_TRUNG"
-    ) {
+    const status = String(fusionStatus || "").trim().toUpperCase().replace(/_/g, " ");
+    if (status === "DAU HIEU MAT TAP TRUNG") {
         return "mat_tap_trung";
     }
-
-    if (
-        status === "DAU HIEU LO AU"
-        || status === "DAU_HIEU_LO_AU"
-    ) {
+    if (status === "CAN CHU Y") {
+        return "can_chu_y";
+    }
+    // Historical AI statuses remain readable; no old database rows are rewritten.
+    if (status === "DAU HIEU LO AU") {
         return "dau_hieu_lo_au";
     }
-
     return null;
 }
 
 function alertConfidence(alertType, ear, lowScore, anxietyScore) {
+    if (alertType === "can_chu_y") return null; // Time-based observation is not a probability.
     if (alertType === "dau_hieu_lo_au") {
         const value = Number(anxietyScore);
         if (Number.isFinite(value)) {
@@ -736,6 +747,51 @@ async function getMappedStudent(
 
     return result.rows[0] || null;
 }
+
+// WEEK9_AUTO_VIDEO_DEMO_RUN_V1: opt-out via AUTO_DEMO_ASSIGN_VIDEO=0.
+// Uses only a DB roster from the chosen class, not biometric identification.
+// A separate mapping table keeps a stable sample name for every video/run/track.
+// Never updates real alerts.student_id or confirmed mappings.
+const videoDemoNameCache = new Map();
+async function getVideoDemoName({ runId, videoId, classId, sessionId, trackId }) {
+    if (process.env.AUTO_DEMO_ASSIGN_VIDEO === '0' || videoId === null ||
+        trackId === null || !validRunId(runId)) return null;
+    const cacheKey = `${runId}:${classId}:${videoId}:${trackId}`;
+    const cached = videoDemoNameCache.get(cacheKey);
+    if (cached && Date.now() - cached.savedAt < 120000) return cached.student;
+
+    // A different run of the same video gets its own allocation. This offset
+    // is NOT person identification; it is only a reproducible DEMO rotation.
+    const offset = Number.parseInt(runId.replace(/-/g, '').slice(-8), 16) >>> 0;
+    await pool.query(`
+        INSERT INTO video_demo_track_names
+          (analysis_run_id, video_id, class_id, session_id, track_id, student_id)
+        SELECT $1::uuid, $2::integer, $3::integer, $4::integer, $5::integer, roster.id
+        FROM (
+          SELECT id,
+            ROW_NUMBER() OVER (ORDER BY id) - 1 AS slot,
+            COUNT(*) OVER () AS count_in_class
+          FROM students WHERE class_id = $3
+        ) AS roster
+        WHERE roster.slot = (($6::bigint + $5::bigint) % roster.count_in_class)
+        ON CONFLICT (analysis_run_id, track_id) DO NOTHING
+    `, [runId, videoId, classId, sessionId, trackId, offset]);
+
+    const record = await pool.query(`
+        SELECT s.id, s.full_name, s.student_code
+        FROM video_demo_track_names d
+        JOIN students s ON s.id = d.student_id AND s.class_id = d.class_id
+        WHERE d.analysis_run_id = $1::uuid AND d.video_id = $2 AND d.class_id = $3
+          AND d.session_id = $4 AND d.track_id = $5
+        LIMIT 1
+    `, [runId, videoId, classId, sessionId, trackId]);
+    const student = record.rows[0] || null;
+    if (videoDemoNameCache.size > 2000) videoDemoNameCache.clear();
+    videoDemoNameCache.set(cacheKey, { student, savedAt: Date.now() });
+    return student;
+}
+
+// Text marker makes demo allocation visibly distinguishable even on an older UI.
 
 // ========================================
 // BUOI HOC
@@ -1739,6 +1795,63 @@ app.put(
 // STATS
 // ========================================
 
+// Non-destructive date bounds for the "Toan bo" stats filter.
+// Unlike the browser's recent alert cache, this considers the matching DB history.
+app.get("/api/stats/date-bounds", authMiddleware, async (req, res) => {
+    try {
+        function optionalId(key) {
+            const raw = String(req.query[key] || "").trim();
+            if (!raw) return null;
+            if (!/^\d+$/.test(raw)) throw new Error(`${key} khong hop le.`);
+            const num = Number(raw);
+            if (!Number.isSafeInteger(num) || num <= 0) throw new Error(`${key} khong hop le.`);
+            return num;
+        }
+        let classId;
+        let sessionId;
+        let studentId;
+        try {
+            classId = optionalId("classId");
+            sessionId = optionalId("sessionId");
+            studentId = optionalId("studentId");
+        } catch (validationError) {
+            return res.status(400).json({ message: validationError.message });
+        }
+        const videoOnly = String(req.query.videoOnly || "") === "1";
+        const query = await pool.query(`
+            SELECT
+                CASE WHEN COUNT(a.id) = 0 THEN NULL
+                     ELSE to_char(
+                       GREATEST(MIN(a.created_at)::date, CURRENT_DATE - 3659),
+                       'YYYY-MM-DD'
+                     ) END AS first_date,
+                to_char(CURRENT_DATE, 'YYYY-MM-DD') AS current_date,
+                COUNT(a.id)::int AS matching_alerts
+            FROM alerts a
+            WHERE ($1::int IS NULL OR a.class_id = $1)
+              AND ($2::int IS NULL OR a.session_id = $2)
+              AND ($3::int IS NULL OR a.student_id = $3)
+              AND ($4::boolean = FALSE OR a.video_id IS NOT NULL)
+              AND (a.video_id IS NULL OR EXISTS (
+                SELECT 1 FROM videos v WHERE v.id = a.video_id
+                  AND a.analysis_run_id IS NOT DISTINCT FROM v.active_analysis_run_id
+              ))
+              AND ($5::boolean OR a.class_id IN (
+                SELECT tc.class_id FROM teacher_classes tc WHERE tc.teacher_id = $6
+              ))
+        `, [classId, sessionId, studentId, videoOnly,
+            req.user.role === "admin", req.user.id]);
+        res.json({
+            from: query.rows[0].first_date,
+            to: query.rows[0].current_date,
+            matching_alerts: query.rows[0].matching_alerts
+        });
+    } catch (error) {
+        console.error("[STATS] Khong lay duoc ngay dau tien:", error);
+        res.status(500).json({ message: "Khong lay duoc pham vi du lieu thong ke." });
+    }
+});
+
 app.get("/api/stats/summary", authMiddleware, async(req, res) => {
     try {
         const result = await pool.query(`
@@ -1770,7 +1883,7 @@ app.get("/api/stats/summary", authMiddleware, async(req, res) => {
                 (SELECT COUNT(*) FROM latest_tracks
                     WHERE fusion_status IN ('DAU HIEU MAT TAP TRUNG','DAU_HIEU_MAT_TAP_TRUNG'))::int AS distracted,
                 (SELECT COUNT(*) FROM latest_tracks
-                    WHERE fusion_status IN ('DAU HIEU LO AU','DAU_HIEU_LO_AU'))::int AS anxiety
+                    WHERE fusion_status IN ('CAN CHU Y','CAN_CHU_Y','DAU HIEU LO AU','DAU_HIEU_LO_AU'))::int AS anxiety
         `, [req.user.role === "admin", req.user.id]);
 
         res.json(result.rows[0]);
@@ -1780,6 +1893,50 @@ app.get("/api/stats/summary", authMiddleware, async(req, res) => {
         res.status(500).json({
             message: "Khong lay duoc thong ke."
         });
+    }
+});
+
+// WEEK9_AI_ANALYTICS_V1: hourly alert counts from PostgreSQL, scoped to viewer.
+// Uses Vietnam local calendar day and preserves the existing active-video/run filtering.
+app.get("/api/stats/today-hourly", authMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            WITH hours AS (
+                SELECT generate_series(0, 23) AS hour
+            ), counts AS (
+                SELECT
+                    EXTRACT(HOUR FROM a.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS hour,
+                    COUNT(a.id)::int AS total
+                FROM alerts a
+                WHERE (a.created_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date =
+                      (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                  AND (a.video_id IS NULL OR EXISTS (
+                      SELECT 1 FROM videos v WHERE v.id = a.video_id
+                        AND a.analysis_run_id IS NOT DISTINCT FROM v.active_analysis_run_id
+                  ))
+                  AND ($1::boolean OR EXISTS (
+                      SELECT 1 FROM teacher_classes tc
+                      WHERE tc.teacher_id = $2 AND tc.class_id = a.class_id
+                  ))
+                GROUP BY 1
+            )
+            SELECT h.hour::int AS hour,
+                   COALESCE(c.total, 0)::int AS total,
+                   to_char((NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date,
+                           'YYYY-MM-DD') AS today
+            FROM hours h
+            LEFT JOIN counts c ON c.hour = h.hour
+            ORDER BY h.hour
+        `, [req.user.role === "admin", req.user.id]);
+        res.setHeader("Cache-Control", "private, no-store");
+        return res.json({
+            day: result.rows[0]?.today || null,
+            timezone: "Asia/Ho_Chi_Minh",
+            hours: result.rows.map(row => ({hour: row.hour, total: row.total}))
+        });
+    } catch (error) {
+        console.error("[STATS] today-hourly:", error);
+        return res.status(500).json({message:"Khong tai duoc bieu do trong ngay."});
     }
 });
 
@@ -1891,7 +2048,7 @@ app.get("/api/stats/trends", authMiddleware, async(req, res) => {
                     WHERE a.alert_type = 'mat_tap_trung'
                 )::int AS distracted,
                 COUNT(a.id) FILTER (
-                    WHERE a.alert_type = 'dau_hieu_lo_au'
+                    WHERE a.alert_type IN ('can_chu_y', 'dau_hieu_lo_au')
                 )::int AS anxiety
             FROM day_list d
             LEFT JOIN alerts a
@@ -2042,7 +2199,7 @@ app.get(
                             WHERE a.alert_type = 'mat_tap_trung'
                         )::int AS distracted,
                         COUNT(*) FILTER (
-                            WHERE a.alert_type = 'dau_hieu_lo_au'
+                            WHERE a.alert_type IN ('can_chu_y', 'dau_hieu_lo_au')
                         )::int AS anxiety,
                         MAX(a.created_at) AS last_alert_at
                     FROM alerts a
@@ -2525,7 +2682,7 @@ app.get("/api/alerts", authMiddleware, async(req, res) => {
 
         if (type) {
             params.push(type);
-            conditions.push(`a.alert_type = $${params.length}`);
+            conditions.push(`(a.alert_type = $${params.length} OR ($${params.length} = 'can_chu_y' AND a.alert_type = 'dau_hieu_lo_au'))`);
         }
 
         if (classIdRaw) {
@@ -2557,14 +2714,27 @@ app.get("/api/alerts", authMiddleware, async(req, res) => {
             `
             SELECT
                 a.*,
-                s.full_name AS student_name,
-                s.student_code,
+                CASE WHEN a.student_id IS NOT NULL THEN s.full_name
+                     WHEN demo_student.id IS NOT NULL THEN demo_student.full_name
+                     ELSE NULL END AS student_name,
+                CASE WHEN a.student_id IS NOT NULL THEN s.student_code
+                     WHEN demo_student.id IS NOT NULL THEN demo_student.student_code
+                     ELSE NULL END AS student_code,
+                CASE WHEN a.student_id IS NOT NULL THEN 'confirmed'
+                     WHEN demo_student.id IS NOT NULL THEN 'demo_unverified'
+                     ELSE 'unassigned' END AS assignment_kind,
                 c.name AS class_name,
                 cs.title AS session_title,
                 cs.session_date,
                 v.original_name AS video_name
             FROM alerts a
             LEFT JOIN students s ON s.id = a.student_id
+            LEFT JOIN video_demo_track_names dm
+              ON dm.analysis_run_id = a.analysis_run_id AND dm.track_id = a.track_id
+             AND dm.video_id = a.video_id AND dm.class_id = a.class_id
+             AND dm.session_id = a.session_id AND a.student_id IS NULL
+            LEFT JOIN students demo_student ON demo_student.id = dm.student_id
+              AND demo_student.class_id = a.class_id
             LEFT JOIN classes c ON c.id = a.class_id
             LEFT JOIN class_sessions cs ON cs.id = a.session_id
             LEFT JOIN videos v ON v.id = a.video_id
@@ -2708,15 +2878,32 @@ app.get("/api/ai/results", authMiddleware, async(req, res) => {
         const result = await pool.query(
             `
             SELECT
+                -- WEEK9_CONSISTENT_AUTO_NAMES_V1: same mapping as /api/alerts.
                 d.*,
-                s.student_code,
-                s.full_name AS student_name,
+                CASE WHEN d.student_id IS NOT NULL THEN s.student_code
+                     WHEN demo_student.id IS NOT NULL THEN demo_student.student_code
+                     ELSE NULL END AS student_code,
+                CASE WHEN d.student_id IS NOT NULL THEN s.full_name
+                     WHEN demo_student.id IS NOT NULL THEN demo_student.full_name
+                     ELSE NULL END AS student_name,
+                CASE WHEN d.student_id IS NOT NULL THEN 'confirmed'
+                     WHEN demo_student.id IS NOT NULL THEN 'demo_unverified'
+                     ELSE 'unassigned' END AS assignment_kind,
                 c.name AS class_name,
                 cs.title AS session_title,
                 cs.session_date,
                 v.original_name AS video_name
             FROM detection_results d
             LEFT JOIN students s ON s.id = d.student_id
+            LEFT JOIN video_demo_track_names dm
+              ON d.student_id IS NULL
+             AND dm.analysis_run_id = d.analysis_run_id
+             AND dm.video_id = d.video_id
+             AND dm.class_id = d.class_id
+             AND dm.session_id = d.session_id
+             AND dm.track_id = d.track_id
+            LEFT JOIN students demo_student ON demo_student.id = dm.student_id
+              AND demo_student.class_id = d.class_id
             LEFT JOIN classes c ON c.id = d.class_id
             LEFT JOIN class_sessions cs ON cs.id = d.session_id
             LEFT JOIN videos v ON v.id = d.video_id
@@ -3006,6 +3193,15 @@ app.post("/api/ai/results", aiIngestAuthMiddleware, async(req, res) => {
             });
         }
 
+        // DEMO ONLY: a sample roster name for an uploaded video's current run.
+        // This never populates normalizedStudentId or changes a verified mapping.
+        const demoName = !student && normalizedTrackId !== null
+            ? await getVideoDemoName({
+                runId, videoId: normalizedVideoId, classId: normalizedClassId,
+                sessionId: normalizedSessionId, trackId: normalizedTrackId
+              })
+            : null;
+
         const normalizedGradcamUrl =
             gradcamUrl
                 ? String(gradcamUrl).trim()
@@ -3214,9 +3410,10 @@ app.post("/api/ai/results", aiIngestAuthMiddleware, async(req, res) => {
                     {
                         ...alert,
                         student_code:
-                            student ? student.student_code : null,
+                            student ? student.student_code : (demoName ? demoName.student_code : null),
                         student_name:
-                            student ? student.full_name : null,
+                            student ? student.full_name : (demoName ? demoName.full_name : null),
+                        assignment_kind: student ? 'confirmed' : (demoName ? 'demo_unverified' : 'unassigned'),
                         class_name:
                             classInfo ? classInfo.name : null,
                         session_title:
@@ -3876,6 +4073,9 @@ app.delete(
                 fs.unlinkSync(video.processed_path);
             }
 
+            // Erase derived face screenshots when the source video is deleted.
+            try { realGradcamService?.deleteGenerated("video", id); }
+            catch (err) { console.error("[GRADCAM REAL] Cleanup video:", err.message); }
             res.json({
                 message: "Da xoa video."
             });
@@ -3887,11 +4087,32 @@ app.delete(
     }
 );
 
+// Remove derived screenshots after an authorized camera recording deletion.
+let realGradcamService = null;
+app.use("/api/camera-recordings/:id", (req, res, next) => {
+    if (req.method === "DELETE") {
+        res.once("finish", () => {
+            if (res.statusCode === 200) {
+                try { realGradcamService?.deleteGenerated("camera", Number(req.params.id)); }
+                catch (err) { console.error("[GRADCAM REAL] Cleanup:", err.message); }
+            }
+        });
+    }
+    next();
+});
+
 // Camera recordings are an isolated add-on; do not change original Video/Grad-CAM routes.
 cameraRecordings.registerCameraRecordingRoutes({
     app, pool, authMiddleware, aiIngestAuthMiddleware,
     assertClassAccess, getActiveCameraContext, jwt,
     recordingDir: CAMERA_RECORDING_DIR
+});
+
+// Independent, authenticated Grad-CAM from actual videos. No database migration.
+realGradcamService = gradcamReal.registerRealGradcamRoutes({
+    app, pool, authMiddleware, assertClassAccess,
+    projectDir: PROJECT_DIR,
+    pythonExe: process.env.PYTHON_EXE || "python"
 });
 
 // ========================================

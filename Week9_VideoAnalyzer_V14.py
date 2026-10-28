@@ -119,8 +119,19 @@ FRAME_HEIGHT = 540
 PERSON_CLASS = 0
 
 EAR_THRESHOLD = 0.21
-MAX_FACE_ANALYSES_PER_FRAME = 1
+MAX_FACE_ANALYSES_PER_FRAME = 3  # Round-robin; improve coverage of crowds, bounded per frame
+SHOW_DEBUG_EYE_LANDMARKS = False  # True only when diagnosing landmark quality
 MAX_POSE_ANALYSES_PER_FRAME = 1
+
+# CROWD_V16: >5 nguoi = uu tien MAT, <=5 nguoi = phan tich MAT + TU THE.
+# Day la nguong thiet ke theo yeu cau, khong phai nguong duoc nghien cuu thuc nghiem.
+CROWD_FACE_ONLY_THRESHOLD = 5
+CROWD_RETURN_TO_FULL_SECONDS = 1.5
+FACE_SIGNAL_FRESH_SECONDS = 2.5  # Bridge brief scheduling gaps, never use unbounded stale evidence
+EYE_MIN_DISTINCT_SAMPLES = 3
+FACE_OBSERVATION_MAX_GAP_SECONDS = 2.5  # Require repeated NEW face observations
+HEAD_AWAY_ESCALATE_SECONDS = 10.0  # Describe behavior only; NOT an anxiety diagnosis
+
 YOLO_EVERY_N_FRAMES = 2
 POSE_EVERY_N_FRAMES = 2
 UPPER_BODY_RATIO = 0.50
@@ -168,8 +179,8 @@ SEAT_RETURN_Y_RATIO = 0.35
 # Dung / ngoi mot minh KHONG bi xem la mat tap trung.
 # Chi canh bao khi mot tin hieu bat thuong keo dai du lau,
 # hoac khi Track ID da duoc xac nhan roi vi tri.
-EYE_CLOSED_ALERT_SECONDS = 1.0
-HEAD_AWAY_ALERT_SECONDS = 3.0
+EYE_CLOSED_ALERT_SECONDS = 1.8
+HEAD_AWAY_ALERT_SECONDS = 5.0  # Observable prolonged head turn; NOT proof of distraction
 
 # Body Pose de bi nhieu hon Head Pose, nen V11 xac nhan nhieu lan
 # va chi tinh khi ket qua Pose con moi.
@@ -191,12 +202,12 @@ FUSION_ALERT_HOLD_SECONDS = 1.5
 # V13 OPTIMIZED:
 # - AI chay tren 1 worker nen camera/YOLO khong phai dung cho TensorFlow.
 # - Chay thua hon V12 de giu FPS khi co 5-8 hoc sinh.
-AI_GLOBAL_INTERVAL_SECONDS = 1.30
-AI_PER_TRACK_INTERVAL_SECONDS = 3.50
+AI_GLOBAL_INTERVAL_SECONDS = 0.75  # If worker is free: prefer responsive FER for visible faces
+AI_PER_TRACK_INTERVAL_SECONDS = 2.50  # Round robin across visible, measurable faces
 AI_RESULT_FRESH_SECONDS = 10.0
 FACE_BBOX_FRESH_SECONDS = 4.5
 AI_EMA_ALPHA = 0.35
-PRINT_AI_RESULTS = False
+PRINT_AI_RESULTS = (os.getenv("KLCN313_DEBUG_AI", "0").strip() == "1")  # Opt-in console debug; overlay never shows percentages
 AI_QUEUE_MAXSIZE = 1
 AI_MIN_PERSON_WIDTH = 110
 AI_MIN_PERSON_HEIGHT = 160
@@ -205,11 +216,25 @@ AI_MIN_PERSON_HEIGHT = 160
 LOW_ENGAGEMENT_THRESHOLD = 0.27
 LOW_ENGAGEMENT_ALERT_SECONDS = 2.0
 
-# Fusion dau hieu lo au: chi la canh bao ho tro, KHONG phai chan doan tam ly.
+# LEGACY: diem emotion/engagement chi luu telemetries, KHONG duoc tao canh bao tam ly.
 NEGATIVE_EMOTION_WEIGHT = 0.75
 ENGAGEMENT_WEIGHT = 0.25
 ANXIETY_FUSION_THRESHOLD = 0.45
 ANXIETY_ALERT_SECONDS = 3.0
+
+# LEGACY: khong duoc bien mot mau FER thanh canh bao tam ly
+# duoc giu lai qua nhieu frame. Nguong CAN KIEM CHUNG tren video co nhan,
+# day chi la hang rao giam duong tinh gia khi demo, khong phai do accuracy.
+ANXIETY_MIN_INDEPENDENT_SAMPLES = 3
+ANXIETY_MIN_SAMPLE_SPAN_SECONDS = 6.0
+ANXIETY_SAMPLE_WINDOW_SECONDS = 20.0
+ANXIETY_STRONG_NEGATIVE_PROB = 0.65
+ANXIETY_STRONG_LOW_ENG_PROB = 0.45
+ANXIETY_MIN_FER_TOP_CONF = 0.55
+ANXIETY_SAMPLE_SYNC_SECONDS = 2.0
+
+# Khong su dung thay doi vi tri de ket luan mat tap trung (khong so do ghe).
+ENABLE_SEAT_AWAY_ALERTS = False
 
 HEAD_AWAY_STATUSES = {
     "QUAY TRAI",
@@ -552,28 +577,119 @@ def estimate_head_pose(landmarks, width, height):
     }
 
 
-def classify_head_pose(yaw, pitch):
-    # Ket qua test thuc te tren camera cua ban:
-    # quay trai -> yaw goc duong, quay phai -> yaw goc am.
-    # Dao dau yaw mot lan de chuan hoa theo huong nguoi dung.
-    yaw_display = -yaw
+def landmark_face_alignment(landmarks, image_size=None):
+    """Face orientation from PIXEL-scale landmarks (never raw unequal x/y ratios).
 
+    FRONT means the head is approximately frontal, NOT that eye gaze or
+    attention has been proved. A blurry/occluded face stays UNCERTAIN.
+    """
+    try:
+        indices = (33, 263, 1, 61, 291, 234, 454)
+        if landmarks is None or len(landmarks) <= max(indices):
+            return "UNCERTAIN"
+        pixel_mode = image_size is not None
+        if pixel_mode:
+            width, height = [float(x) for x in image_size]
+            if not (math.isfinite(width) and math.isfinite(height)) or min(width, height) <= 0:
+                return "UNCERTAIN"
+        else:
+            # Backward-compatible normalized-landmark calls (e.g. old tests).
+            width, height = 1.0, 1.0
+
+        points = {}
+        for idx in indices:
+            xx, yy = float(landmarks[idx].x), float(landmarks[idx].y)
+            if not (math.isfinite(xx) and math.isfinite(yy)):
+                return "UNCERTAIN"
+            if not (-0.05 <= xx <= 1.05 and -0.05 <= yy <= 1.05):
+                return "UNCERTAIN"
+            points[idx] = np.array([xx * width, yy * height], dtype=float)
+
+        left, right = points[33], points[263]
+        eye_vector = right - left
+        eye_sep = float(np.linalg.norm(eye_vector))
+        min_eye_sep = 14.0 if pixel_mode else 0.045
+        if eye_sep < min_eye_sep:
+            return "UNCERTAIN"  # Too few pixels for trustworthy head direction.
+        horizontal = eye_vector / eye_sep
+        down = np.array([-horizontal[1], horizontal[0]])
+        eye_middle = (left + right) / 2.0
+        nose = points[1]
+        mouth_middle = (points[61] + points[291]) / 2.0
+
+        # Rotation-invariant: head tilt should not change frontal/side result.
+        if float(np.dot(mouth_middle - eye_middle, down)) < 0.0:
+            down = -down
+        nose_y = float(np.dot(nose - eye_middle, down)) / eye_sep
+        mouth_y = float(np.dot(mouth_middle - eye_middle, down)) / eye_sep
+        if not (0.06 < nose_y < mouth_y + 0.12 and 0.24 < mouth_y < 2.15):
+            return "UNCERTAIN"
+
+        nose_shift = abs(float(np.dot(nose - eye_middle, horizontal))) / eye_sep
+        mouth_shift = abs(float(np.dot(mouth_middle - eye_middle, horizontal))) / eye_sep
+        cheek_l = abs(float(np.dot(nose - points[234], horizontal)))
+        cheek_r = abs(float(np.dot(points[454] - nose, horizontal)))
+        if min(cheek_l, cheek_r) < 0.10 * eye_sep:
+            return "UNCERTAIN"
+        balance = min(cheek_l, cheek_r) / max(cheek_l, cheek_r)
+
+        # Allow moderate individual asymmetry; prefer UNKNOWN over a false turn.
+        if nose_shift <= 0.34 and mouth_shift <= 0.43 and balance >= 0.33:
+            return "FRONT"
+        if nose_shift >= 0.53 or (nose_shift >= 0.40 and balance <= 0.22):
+            return "TURNED"
+        return "UNCERTAIN"
+    except (IndexError, TypeError, AttributeError, ValueError,
+            ZeroDivisionError, OverflowError):
+        return "UNCERTAIN"
+
+
+def landmarks_strongly_front_facing(landmarks):
+    return landmark_face_alignment(landmarks) == "FRONT"
+
+
+def classify_head_pose(yaw, pitch, landmarks=None, image_size=None):
+    """Resolve face direction conservatively using pixel-correct face geometry.
+
+    solvePnP is only an auxiliary cue: its focal point in a cropped person
+    box is not a calibrated physical camera. Do not mistake its artefacts for
+    sustained turning, or for a clinical/attention inference.
+    """
+    alignment = landmark_face_alignment(landmarks, image_size) if landmarks is not None else "UNCERTAIN"
+
+    # A clear frontal face overrides an artefact in solvePnP pitch/yaw.
+    if alignment == "FRONT":
+        return "NHIN THANG"
+
+    try:
+        yaw = float(yaw)
+        pitch = float(pitch)
+        if not (math.isfinite(yaw) and math.isfinite(pitch)):
+            return "POSE UNKNOWN"
+    except (TypeError, ValueError):
+        return "POSE UNKNOWN"
+
+    yaw_display = -yaw
+    if alignment == "TURNED" and abs(yaw) >= 18.0:
+        return "QUAY TRAI" if yaw_display < 0 else "QUAY PHAI"
+
+    # A face found but too small/occluded or with conflicting cues stays gray.
+    if landmarks is not None:
+        return "POSE UNKNOWN"
+
+    # Backwards compatible angle-only path for external callers/tests.
     if yaw_display <= -YAW_THRESHOLD:
         return "QUAY TRAI"
-
     if yaw_display >= YAW_THRESHOLD:
         return "QUAY PHAI"
-
     if pitch >= PITCH_DOWN_THRESHOLD:
         return "CUI DAU"
-
     if pitch <= PITCH_UP_THRESHOLD:
         return "NGUOC LEN"
-
     return "NHIN THANG"
 
 
-def analyze_face(face_landmarker, person_crop):
+def analyze_face(face_landmarker, person_crop, upper_body_ratio=UPPER_BODY_RATIO):
     if person_crop is None or person_crop.size == 0:
         return False, None, "NO FACE", None, [], [], None
 
@@ -582,7 +698,7 @@ def analyze_face(face_landmarker, person_crop):
     if h < MIN_PERSON_HEIGHT or w < MIN_PERSON_WIDTH:
         return False, None, "TOO SMALL", None, [], [], None
 
-    upper_h = max(1, int(h * UPPER_BODY_RATIO))
+    upper_h = max(1, int(h * upper_body_ratio))
     upper_crop = person_crop[0:upper_h, :]
 
     scale = 2.0
@@ -629,21 +745,29 @@ def analyze_face(face_landmarker, person_crop):
         upscaled.shape[0]
     )
 
-    left_ear = eye_aspect_ratio(left_points_up)
-    right_ear = eye_aspect_ratio(right_points_up)
-    ear = (left_ear + right_ear) / 2.0
-
-    eye_status = (
-        "NHAM MAT"
-        if ear < EAR_THRESHOLD
-        else "MO MAT"
-    )
+    # A tiny/blurry eye may collapse to identical pixel points and produce
+    # EAR=0.0, which the old code incorrectly called "eyes closed".
+    horizontal_left = dist(left_points_up[0], left_points_up[3])
+    horizontal_right = dist(right_points_up[0], right_points_up[3])
+    if min(horizontal_left, horizontal_right) < 8.0:
+        ear = None
+        eye_status = "MAT CHUA RO"
+    else:
+        left_ear = eye_aspect_ratio(left_points_up)
+        right_ear = eye_aspect_ratio(right_points_up)
+        ear = (left_ear + right_ear) / 2.0
+        eye_status = "NHAM MAT" if ear < EAR_THRESHOLD else "MO MAT"
 
     head_pose = estimate_head_pose(
         landmarks,
         upscaled.shape[1],
         upscaled.shape[0]
     )
+    if head_pose is None:
+        # 2D landmarks may still be reliable when uncalibrated solvePnP fails.
+        head_pose = {"yaw": None, "pitch": None, "roll": None}
+    head_pose["landmarks"] = landmarks
+    head_pose["image_size"] = (upscaled.shape[1], upscaled.shape[0])
 
     # Bounding box khuon mat theo toa do CHUAN HOA cua person_crop.
     # Dung lai bbox nay cho FER de khong can chay them face detector.
@@ -1043,6 +1167,29 @@ def get_person_display(head_status, eye_status, body_status, seat_away=False):
     return text, (0, 200, 0)
 
 
+# CROWD_V16_DISPLAY_FIX: the box color denotes FACE DIRECTION only,
+# not a separate Fusion/Engagement flag. FER is shown independently.
+def face_direction_and_fer_labels(head_status, fer_label, fer_conf, fer_fresh,
+                                  eye_status="", eye_seconds=0.0, head_seconds=0.0):
+    direction, color = visual_face_state(head_status, eye_status, eye_seconds, head_seconds)
+
+    # V16.4: short overlay labels; the underlying FER model is unchanged.
+    # Low confidence is not a verified emotion: show only "Chưa rõ".
+    emotion = "Đang phân tích"
+    if fer_fresh and fer_label in FER_CLASSES:
+        try:
+            score = float(fer_conf)
+        except (TypeError, ValueError):
+            score = float("nan")
+        if math.isfinite(score) and 0 <= score <= 1:
+            if score >= 0.55:
+                candidate = FER_DISPLAY.get(fer_label, fer_label)
+                emotion = candidate
+            else:
+                emotion = "Chưa rõ"
+    return direction, color, emotion
+
+
 def draw_unicode_labels(frame, labels, hud_lines):
     """
     Vẽ toàn bộ chữ Unicode một lần bằng Pillow để đỡ tốn FPS.
@@ -1274,6 +1421,29 @@ def ema_probs(old_probs, new_probs, alpha=AI_EMA_ALPHA):
     return smoothed
 
 
+def ready_for_face_ai(cache, current_time):
+    """Do not queue single-worker FER jobs before a fresh face ROI exists.
+
+    This avoids spending time evaluating engagement only, and therefore
+    improves label coverage in small groups. No guess is made when a face
+    is too small, lost, or occluded.
+    """
+    if cache.get("ai_pending", False):
+        return False
+    if not cache.get("face_found", False):
+        return False
+    if cache.get("face_bbox_norm") is None:
+        return False
+    last = float(cache.get("face_bbox_time", -1e9))
+    if not (0 <= float(current_time) - last <= FACE_SIGNAL_FRESH_SECONDS):
+        return False
+    try:
+        x1, y1, x2, y2 = cache["face_bbox_norm"]
+        return (x2 - x1) > 0.03 and (y2 - y1) > 0.02
+    except (ValueError, TypeError):
+        return False
+
+
 def crop_face_from_norm(person_crop, bbox_norm):
     if person_crop is None or person_crop.size == 0 or bbox_norm is None:
         return None
@@ -1302,8 +1472,23 @@ def run_track_ai(
     """Chay AI cho 1 Track ID va luu ket qua vao cache cua ID do."""
     cache["ai_last_inference_time"] = float(current_time)
 
-    # Engagement: dung person ROI vi V12 can ket qua RIENG tung hoc sinh.
-    eng_new = predict_probs(engagement_model, person_crop)
+    # FACE_ONLY: AI chi nhin ROI mat neu chat luong crop du de phan tich.
+    # Khong chay suy luan tren toan bo nguoi trong crowd mode.
+    face_bbox_time = float(cache.get("face_bbox_time", -1e9))
+    face_bbox_fresh = (
+        cache.get("face_bbox_norm") is not None
+        and (float(current_time) - face_bbox_time) <= FACE_BBOX_FRESH_SECONDS
+    )
+    face_crop = crop_face_from_norm(person_crop, cache.get("face_bbox_norm")) if face_bbox_fresh else None
+    if cache.get("crowd_face_only", False):
+        if face_crop is None:
+            cache["ai_error"] = "Mặt không đủ rõ để phân tích biểu cảm"
+            return
+        eng_crop = face_crop
+    else:
+        eng_crop = person_crop
+
+    eng_new = predict_probs(engagement_model, eng_crop)
     if eng_new is not None and len(eng_new) >= 4:
         eng_probs = ema_probs(cache.get("eng_probs"), eng_new[:4])
         cache["eng_probs"] = eng_probs
@@ -1314,19 +1499,9 @@ def run_track_ai(
         cache["eng_conf"] = float(eng_probs[eng_idx])
         cache["eng_low_score"] = float(eng_probs[0] + eng_probs[1])
 
-    # FER: chi chay neu bbox khuon mat con moi.
-    face_bbox_time = float(cache.get("face_bbox_time", -1e9))
-    face_bbox_fresh = (
-        cache.get("face_bbox_norm") is not None
-        and (float(current_time) - face_bbox_time) <= FACE_BBOX_FRESH_SECONDS
-    )
-
-    if face_bbox_fresh:
-        face_crop = crop_face_from_norm(
-            person_crop,
-            cache.get("face_bbox_norm")
-        )
-
+    # FER luon dung khuon mat (khong dung nguoi), va phai la mat moi.
+    # A weak top score stays 'Chưa rõ' in the UI; NEVER fabricate emotion.
+    if face_crop is not None:
         fer_new = predict_probs(fer_model, face_crop)
         if fer_new is not None and len(fer_new) >= 7:
             fer_probs = ema_probs(cache.get("fer_probs"), fer_new[:7])
@@ -1498,6 +1673,125 @@ def update_auto_seat_anchor(cache, box, current_time):
 
 
 # ============================================================
+# CROWD V16: CHON CHE DO THEO SO TRACK HIEN TAI
+# ============================================================
+
+def choose_face_only_mode(previous, low_since, person_count, current_time):
+    """Vao FACE_ONLY ngay khi >5, tro lai FULL sau 1.5s on dinh <=5.
+
+    Khong dung danh tinh, vi tri ghe, hay ket qua FER de quyet dinh mode.
+    """
+    t = float(current_time)
+    if int(person_count) > CROWD_FACE_ONLY_THRESHOLD:
+        return True, None
+    if not previous:
+        return False, None
+    if low_since is None or t < float(low_since):
+        return True, t
+    if t - float(low_since) >= CROWD_RETURN_TO_FULL_SECONDS:
+        return False, None
+    return True, low_since
+
+
+def reset_crowd_transition(cache, face_only):
+    """Clear mode-specific interpretations; DO NOT clear Track ID or FER model."""
+    cache["crowd_face_only"] = bool(face_only)
+    cache["body_found"] = False
+    cache["body_status"] = "TU THE CHUA RO"
+    cache["body_last_reliable_status"] = None
+    cache["body_last_reliable_time"] = -1e9
+    cache["body_turn_confirmations"] = 0
+    cache["seat_away"] = False
+    cache["seat_away_since"] = None
+    cache["fusion_last_alert_time"] = None
+    cache["fusion_status"] = "BINH THUONG"
+    cache["fusion_reason"] = ""
+    for key in ("fusion_eye", "fusion_head", "fusion_body_turn", "final_low_eng", "final_anxiety"):
+        cache[f"{key}_since"] = None
+        cache[f"{key}_duration"] = 0.0
+    cache["final_status"] = "BINH THUONG"
+    cache["final_reason"] = ""
+    for kind in ("head", "eye"):
+        cache[f"v162_{kind}_last"] = None
+        cache[f"v162_{kind}_start"] = None
+        cache[f"v162_{kind}_samples"] = 0
+        cache[f"v162_{kind}_seconds"] = 0.0
+    # Khi nguon input AI chuyen tu toan than sang mat (hoac nguoc lai),
+    # ket qua model cu khong con tuong thich. Bo cache, KHONG sua model.
+    cache["eng_probs"] = None
+    cache["eng_label"] = None
+    cache["eng_conf"] = 0.0
+    cache["eng_low_score"] = 0.0
+    cache["eng_last_time"] = -1e9
+    cache["fer_probs"] = None
+    cache["fer_label"] = None
+    cache["fer_conf"] = 0.0
+    cache["negative_emotion"] = 0.0
+    cache["fer_last_time"] = -1e9
+    cache["anxiety_score"] = 0.0
+    cache["_anxiety_independent_samples"] = []
+    cache["_anxiety_last_checked_fer_at"] = -1e9
+
+
+# V16.2: timestamps are taken ONLY when MediaPipe analyzes a NEW frame.
+# Cached head/eye labels cannot silently accumulate durations when the face is lost.
+def update_observed_face_durations(cache, head_status, eye_status, observed_at):
+    now = float(observed_at)
+    for kind, active in (("head", head_status in HEAD_AWAY_STATUSES),
+                         ("eye", eye_status == "NHAM MAT")):
+        last_key = f"v162_{kind}_last"
+        start_key = f"v162_{kind}_start"
+        sample_key = f"v162_{kind}_samples"
+        duration_key = f"v162_{kind}_seconds"
+        old = cache.get(last_key)
+        gap = (now - float(old)) if old is not None else None
+        if not active:
+            cache[start_key] = None
+            cache[last_key] = None
+            cache[sample_key] = 0
+            cache[duration_key] = 0.0
+            continue
+        if gap is not None and abs(gap) < 1e-4:
+            continue  # Do not count the same video frame twice.
+        if gap is None or gap < 0 or gap > FACE_OBSERVATION_MAX_GAP_SECONDS:
+            cache[start_key] = now
+            cache[sample_key] = 1
+        else:
+            cache[sample_key] = min(100000, int(cache.get(sample_key, 0)) + 1)
+        cache[last_key] = now
+        cache[duration_key] = max(0.0, now - float(cache[start_key]))
+
+
+def verified_observation_seconds(cache, kind, now, min_samples=3):
+    last = cache.get(f"v162_{kind}_last")
+    if last is None or float(now) < float(last) or float(now) - float(last) > FACE_OBSERVATION_MAX_GAP_SECONDS:
+        return 0.0
+    if int(cache.get(f"v162_{kind}_samples", 0)) < int(min_samples):
+        return 0.0
+    return max(0.0, float(cache.get(f"v162_{kind}_seconds", 0.0)))
+
+
+def visual_face_state(head_status, eye_status, verified_eye_seconds, verified_head_seconds):
+    """BGR colors only reflect OBSERVED face/eye direction, not FER/Fusion psychology."""
+    if eye_status == "NHAM MAT" and verified_eye_seconds >= EYE_CLOSED_ALERT_SECONDS:
+        return f"Nhắm mắt kéo dài {verified_eye_seconds:.1f}s", (0, 0, 255)
+    if head_status in HEAD_AWAY_STATUSES:
+        if verified_head_seconds >= HEAD_AWAY_ESCALATE_SECONDS:
+            return f"Lệch hướng {verified_head_seconds:.0f}s • cần chú ý", (0, 165, 255)
+        if verified_head_seconds >= HEAD_AWAY_ALERT_SECONDS:
+            return f"Lệch hướng {verified_head_seconds:.0f}s", (0, 165, 255)
+        return "Lệch hướng", (0, 165, 255)
+    if head_status == "NHIN THANG":
+        # A brief blink isn't a sustained red warning.
+        return "Nhìn về camera", (0, 200, 0)
+    if head_status in ("DANG TIM MAT", "CHUA PHAN TICH", "NO FACE"):
+        return "Đang tìm mặt", (145, 145, 145)
+    if head_status in ("QUA XA / MAT QUA NHO", "TOO SMALL"):
+        return "Mặt quá nhỏ", (145, 145, 145)
+    return "Chưa rõ hướng mặt", (145, 145, 145)
+
+
+# ============================================================
 # FUSION HANH VI THEO THOI GIAN - TUNG TRACK ID
 # ============================================================
 
@@ -1536,8 +1830,12 @@ def update_behavior_fusion(cache, current_time):
     body_status = cache.get("body_status", "")
     seat_away = bool(cache.get("seat_away", False))
 
-    eye_active = (eye_status == "NHAM MAT")
-    head_active = (head_status in HEAD_AWAY_STATUSES)
+    crowd_mode = bool(cache.get("crowd_face_only", False))
+    last_face = float(cache.get("face_last_observed_time", -1e9))
+    face_fresh = (0 <= float(current_time) - last_face <= FACE_SIGNAL_FRESH_SECONDS)
+    # A label cached from a previous face detection is NOT a fresh measurement.
+    eye_active = face_fresh and eye_status == "NHAM MAT"
+    head_active = face_fresh and head_status in HEAD_AWAY_STATUSES
 
     body_last_reliable_time = float(
         cache.get("body_last_reliable_time", 0.0)
@@ -1553,17 +1851,18 @@ def update_behavior_fusion(cache, current_time):
     )
 
     body_turn_active = (
-        body_status in BODY_TURN_STATUSES
+        not crowd_mode
+        and body_status in BODY_TURN_STATUSES
         and body_fresh
         and body_turn_confirmations >= BODY_TURN_START_CONFIRMATIONS
     )
 
-    eye_seconds = update_signal_timer(
-        cache, "fusion_eye", eye_active, current_time
-    )
-    head_seconds = update_signal_timer(
-        cache, "fusion_head", head_active, current_time
-    )
+    # Durations depend on independent, recent face observations, never just a
+    # previously cached label carried forward across frames or lost tracking.
+    eye_seconds = verified_observation_seconds(cache, "eye", current_time) if eye_active else 0.0
+    head_seconds = verified_observation_seconds(cache, "head", current_time) if head_active else 0.0
+    cache["fusion_eye_duration"] = eye_seconds
+    cache["fusion_head_duration"] = head_seconds
     body_seconds = update_signal_timer(
         cache, "fusion_body_turn", body_turn_active, current_time
     )
@@ -1571,34 +1870,28 @@ def update_behavior_fusion(cache, current_time):
     reasons = []
 
     if eye_seconds >= EYE_CLOSED_ALERT_SECONDS:
-        reasons.append("Nhắm mắt kéo dài")
+        reasons.append(f"Nhắm mắt kéo dài {eye_seconds:.1f}s")
+    elif head_seconds >= HEAD_AWAY_ALERT_SECONDS:
+        # This is an attention CHECK, never an anxiety/mental-health diagnosis.
+        qualifier = " • cần giáo viên kiểm tra" if head_seconds >= HEAD_AWAY_ESCALATE_SECONDS else ""
+        reasons.append(f"Lệch hướng liên tục {head_seconds:.1f}s{qualifier}")
 
-    if head_seconds >= HEAD_AWAY_ALERT_SECONDS:
-        if head_status == "CUI DAU":
-            reasons.append("Cúi đầu kéo dài")
-        elif head_status == "QUAY KHUAT / KHONG NHIN PHIA TRUOC":
-            reasons.append("Không nhìn phía trước")
-        else:
-            reasons.append("Quay đầu kéo dài")
-
-    # Hai tin hieu doc lap cung keo dai -> tin cay hon Body Pose don le.
+    # Head direction alone is not proof of inattention (teacher/board may be
+    # to the side). At >=5 seconds, emit a REVIEW alert with observable reason.
+    # At >=10 seconds do NOT turn this into an anxiety diagnosis.
     combined_head_body = (
-        head_active
+        not crowd_mode
+        and head_active
         and body_turn_active
         and head_seconds >= HEAD_BODY_COMBINED_SECONDS
         and body_seconds >= HEAD_BODY_COMBINED_SECONDS
     )
 
-    if combined_head_body:
-        reasons.append("Quay đầu + quay người kéo dài")
-    elif (
-        body_seconds >= BODY_TURN_ALERT_SECONDS
-        and body_turn_confirmations >= BODY_TURN_ALERT_CONFIRMATIONS
-    ):
-        reasons.append("Quay người kéo dài")
-
+    # Hai huong/tu the ket hop van chi la quan sat, KHONG la bang chung
+    # chac chan cho mat tap trung. Canh bao do chi tu nham mat lap lai
+    # va keo dai (hoac roi vi tri neu sau nay duoc xac minh/bat rieng).
     # seat_away da co bo dem SEAT_EXIT_SECONDS tu V9/V10.
-    if seat_away:
+    if not crowd_mode and ENABLE_SEAT_AWAY_ALERTS and seat_away:
         reasons.append("Rời vị trí")
 
     if reasons:
@@ -1648,79 +1941,86 @@ def update_behavior_fusion(cache, current_time):
     return fusion_status, fusion_reason
 
 
+def has_independent_multimodal_evidence(cache, current_time, fer_fresh, eng_fresh):
+    """Only repeated NEW FER + DAiSEE inferences can trigger the sensitive alert.
+
+    A single FER result may be cached for ~10 s and reused over hundreds of
+    video frames. Frame count / signal timer is *not* independent evidence.
+    Keep the separate observation times to prevent a lone sad-face prediction
+    being described as a sustained state. This is deliberately conservative.
+    """
+    now = float(current_time)
+    fer_at = float(cache.get("fer_last_time", -1e9))
+    eng_at = float(cache.get("eng_last_time", -1e9))
+    events = cache.setdefault("_anxiety_independent_samples", [])
+    events[:] = [float(t) for t in events if 0 <= now - float(t) <= ANXIETY_SAMPLE_WINDOW_SECONDS]
+
+    # Examine a FER prediction only once when its timestamp CHANGES.
+    # If inference timestamps reset (e.g. restarted stream), reset history.
+    previously_seen = float(cache.get("_anxiety_last_checked_fer_at", -1e9))
+    if fer_at < previously_seen:
+        events.clear()
+        previously_seen = -1e9
+    if fer_at > previously_seen:
+        cache["_anxiety_last_checked_fer_at"] = fer_at
+        strong_independent_evidence = (
+            fer_fresh and eng_fresh
+            and abs(fer_at - eng_at) <= ANXIETY_SAMPLE_SYNC_SECONDS
+            and str(cache.get("fer_label", "")) in ("sad", "fear", "angry")
+            and float(cache.get("fer_conf", 0.0)) >= ANXIETY_MIN_FER_TOP_CONF
+            and float(cache.get("negative_emotion", 0.0)) >= ANXIETY_STRONG_NEGATIVE_PROB
+            and float(cache.get("eng_low_score", 0.0)) >= ANXIETY_STRONG_LOW_ENG_PROB
+        )
+        if strong_independent_evidence:
+            events.append(fer_at)
+        else:
+            # Require consecutive independent observations, not cherry-picked ones.
+            events.clear()
+
+    return (
+        len(events) >= ANXIETY_MIN_INDEPENDENT_SAMPLES
+        and events[-1] - events[-ANXIETY_MIN_INDEPENDENT_SAMPLES] >= ANXIETY_MIN_SAMPLE_SPAN_SECONDS
+        and 0 <= now - events[-1] <= min(AI_RESULT_FRESH_SECONDS, 5.0)
+        and fer_fresh and eng_fresh
+    )
+
+
 def update_final_fusion(cache, current_time, behavior_status, behavior_reason):
+    """Escalate OBSERVED prolonged head turns, not inferred psychology.
+
+    5-<10 seconds -> existing attention-review alert from behavior fusion.
+    >=10 seconds -> CAN CHU Y. A stale/lost face must never accumulate time.
+    FER/DAiSEE continue as descriptive estimates, not diagnoses.
     """
-    V13 Fusion cuoi cung theo tung Track ID:
-    - Hanh vi V11 la nhanh chinh cho mat tap trung.
-    - DAiSEE Low Engagement la tin hieu ho tro.
-    - FER + Engagement tao diem CANH BAO DAU HIEU LO AU.
-    - Khong duoc hieu la chan doan tam ly.
-    """
-    fer_time = float(cache.get("fer_last_time", -1e9))
     eng_time = float(cache.get("eng_last_time", -1e9))
-
-    fer_fresh = (float(current_time) - fer_time) <= AI_RESULT_FRESH_SECONDS
-    eng_fresh = (float(current_time) - eng_time) <= AI_RESULT_FRESH_SECONDS
-
+    eng_fresh = 0 <= float(current_time) - eng_time <= AI_RESULT_FRESH_SECONDS
     low_score = float(cache.get("eng_low_score", 0.0))
-    anxiety_score = float(cache.get("anxiety_score", 0.0))
+    low_active = eng_fresh and low_score >= LOW_ENGAGEMENT_THRESHOLD
 
-    low_active = (
-        eng_fresh
-        and low_score >= LOW_ENGAGEMENT_THRESHOLD
-    )
+    # update_behavior_fusion() computes this from independent fresh MediaPipe
+    # observations; no time is added while the face is missing or uncertain.
+    last_face = float(cache.get("face_last_observed_time", -1e9))
+    face_fresh = 0 <= float(current_time) - last_face <= FACE_SIGNAL_FRESH_SECONDS
+    head_active = face_fresh and cache.get("head_status") in HEAD_AWAY_STATUSES
+    head_seconds = float(cache.get("fusion_head_duration", 0.0)) if head_active else 0.0
 
-    # Can co FER con moi moi cho phep kich hoat dau hieu lo au.
-    # Engagement co the ho tro diem, nhung khong tu no tao canh bao lo au.
-    anxiety_active = (
-        fer_fresh
-        and anxiety_score >= ANXIETY_FUSION_THRESHOLD
-    )
+    # Do not relabel negative emotions as a mental-health warning.
+    # Retain legacy cache keys for compatibility with telemetry and reports.
+    cache["final_anxiety_since"] = None
+    cache["final_anxiety_duration"] = 0.0
+    cache["final_anxiety_seconds"] = 0.0
+    low_seconds = update_signal_timer(cache, "final_low_eng", low_active, current_time)
 
-    low_seconds = update_signal_timer(
-        cache, "final_low_eng", low_active, current_time
-    )
-    anxiety_seconds = update_signal_timer(
-        cache, "final_anxiety", anxiety_active, current_time
-    )
-
-    if anxiety_seconds >= ANXIETY_ALERT_SECONDS:
-        final_status = "DAU HIEU LO AU"
-
-        fer_label = cache.get("fer_label")
-        fer_text = FER_DISPLAY.get(fer_label, fer_label) if fer_label else "Cảm xúc tiêu cực"
-        final_reason = f"{fer_text} + tín hiệu AI kéo dài"
-
+    if head_seconds >= HEAD_AWAY_ESCALATE_SECONDS:
+        final_status = "CAN CHU Y"
+        final_reason = f"Quay mặt liên tục {head_seconds:.1f}s; cần giáo viên xem xét"
     elif behavior_status == "DAU HIEU MAT TAP TRUNG":
         final_status = "DAU HIEU MAT TAP TRUNG"
         final_reason = behavior_reason
-
-    elif (
-        low_seconds >= LOW_ENGAGEMENT_ALERT_SECONDS
-        and behavior_status == "THEO DOI"
-    ):
-        # V13: DAiSEE Engagement chi la tin hieu HO TRO.
-        # Khong de Low Engagement mot minh ket luan mat tap trung.
-        final_status = "DAU HIEU MAT TAP TRUNG"
-        if behavior_reason:
-            final_reason = f"{behavior_reason} + Engagement thấp"
-        else:
-            final_reason = "Tín hiệu hành vi + Engagement thấp"
-
-    elif (
-        behavior_status == "THEO DOI"
-        or low_active
-        or anxiety_active
-    ):
+    elif behavior_status == "THEO DOI" or low_active:
         final_status = "THEO DOI"
-
-        if behavior_status == "THEO DOI" and behavior_reason:
-            final_reason = behavior_reason
-        elif anxiety_active:
-            final_reason = "Tín hiệu cảm xúc đang theo dõi"
-        else:
-            final_reason = "Engagement thấp đang theo dõi"
-
+        final_reason = (behavior_reason if behavior_status == "THEO DOI" and behavior_reason
+                        else "Engagement thấp đang theo dõi")
     else:
         final_status = "BINH THUONG"
         final_reason = ""
@@ -1728,8 +2028,6 @@ def update_final_fusion(cache, current_time, behavior_status, behavior_reason):
     cache["final_status"] = final_status
     cache["final_reason"] = final_reason
     cache["final_low_seconds"] = low_seconds
-    cache["final_anxiety_seconds"] = anxiety_seconds
-
     return final_status, final_reason
 
 
@@ -1954,6 +2252,8 @@ round_robin_start = 0
 pose_round_robin_start = 0
 ai_round_robin_start = 0
 last_global_ai_inference_time = -1e9
+crowd_face_only = False
+crowd_low_since = None
 
 # V14: 1 worker AI nen, khong block vong camera.
 ai_job_queue = queue.Queue(maxsize=AI_QUEUE_MAXSIZE)
@@ -2130,6 +2430,9 @@ try:
                             "fusion_last_alert_time": None,
                             "face_bbox_norm": None,
                             "face_bbox_time": -1e9,
+                            "face_last_observed_time": -1e9,
+                            "eye_closed_distinct_samples": 0,
+                            "crowd_face_only": False,
                             "ai_last_inference_time": -1e9,
                             "ai_pending": False,
                             "fer_probs": None,
@@ -2183,6 +2486,18 @@ try:
             for d in detections
         ]
 
+        previous_crowd_mode = crowd_face_only
+        crowd_face_only, crowd_low_since = choose_face_only_mode(
+            crowd_face_only, crowd_low_since, len(visible_ids), current_time
+        )
+        if previous_crowd_mode != crowd_face_only:
+            print("[CROWD V16]", "FACE_ONLY" if crowd_face_only else "FULL",
+                  "| persons:", len(visible_ids), flush=True)
+        for tid in visible_ids:
+            c = track_cache[tid]
+            if c.get("crowd_face_only") != crowd_face_only:
+                reset_crowd_transition(c, crowd_face_only)
+
         analyze_ids = []
 
         if visible_ids:
@@ -2209,6 +2524,7 @@ try:
 
         if (
             visible_ids
+            and not crowd_face_only
             and (frame_index % POSE_EVERY_N_FRAMES) == 0
         ):
             pose_count = min(
@@ -2227,8 +2543,10 @@ try:
             ) % len(visible_ids)
 
 
-        # V14: chi xep AI job khi worker dang ranh.
-        # Khong cho hang doi day de tranh TensorFlow chiem CPU lien tuc.
+        # Schedule FER only for a FRESH, sizable face. The old queue eagerly
+        # spent its one worker on tracks with no face ROI, so visible faces
+        # stayed at "Đang phân tích" longer than necessary. Both camera and
+        # uploaded video use this same branch.
         ai_analyze_id = None
         if (
             visible_ids
@@ -2241,10 +2559,8 @@ try:
                 idx = (ai_round_robin_start + offset) % len(visible_ids)
                 candidate_id = visible_ids[idx]
                 candidate_cache = track_cache[candidate_id]
-
-                if candidate_cache.get("ai_pending", False):
+                if not ready_for_face_ai(candidate_cache, current_time):
                     continue
-
                 if (
                     current_time
                     - float(candidate_cache.get("ai_last_inference_time", -1e9))
@@ -2358,7 +2674,8 @@ try:
                     face_bbox_norm
                 ) = analyze_face(
                     face_landmarker,
-                    person_crop
+                    person_crop,
+                    upper_body_ratio=0.65 if crowd_face_only else UPPER_BODY_RATIO,
                 )
 
                 cache["face_found"] = face_found
@@ -2368,6 +2685,15 @@ try:
                     cache["ever_seen_face"] = True
                     cache["missing_since"] = None
 
+                    prev_face_t = float(cache.get("face_last_observed_time", -1e9))
+                    if eye_status == "NHAM MAT":
+                        if 0 <= current_time - prev_face_t <= FACE_SIGNAL_FRESH_SECONDS                                 and int(cache.get("eye_closed_distinct_samples", 0)):
+                            cache["eye_closed_distinct_samples"] += 1
+                        else:
+                            cache["eye_closed_distinct_samples"] = 1
+                    else:
+                        cache["eye_closed_distinct_samples"] = 0
+                    cache["face_last_observed_time"] = float(current_time)
                     cache["ear"] = ear
                     cache["eye_status"] = eye_status
                     cache["face_bbox_norm"] = face_bbox_norm
@@ -2383,8 +2709,9 @@ try:
                         cache["roll"] = roll
 
                         cache["head_status"] = classify_head_pose(
-                            yaw,
-                            pitch
+                            yaw, pitch,
+                            head_pose.get("landmarks"),
+                            head_pose.get("image_size")
                         )
 
                     else:
@@ -2393,11 +2720,20 @@ try:
                         cache["roll"] = None
                         cache["head_status"] = "POSE UNKNOWN"
 
+                    # One fresh facial landmark observation; both webcam and
+                    # uploaded video execute this identical pathway.
+                    update_observed_face_durations(
+                        cache, cache["head_status"], cache["eye_status"], current_time
+                    )
+
                 else:
 
                     # Xoa ket qua cu de tranh hien stale yaw/pitch/ear
                     cache["ear"] = None
                     cache["eye_status"] = eye_status
+                    cache["eye_closed_distinct_samples"] = 0
+                    cache["face_bbox_norm"] = None
+                    cache["face_bbox_time"] = -1e9
                     cache["yaw"] = None
                     cache["pitch"] = None
                     cache["roll"] = None
@@ -2423,78 +2759,75 @@ try:
                             - cache["missing_since"]
                         )
 
-                        if (
-                            cache["ever_seen_face"]
-                            and
-                            missing_duration
-                            >= FACE_MISSING_TURNED_SECONDS
-                        ):
-                            cache["head_status"] = (
-                                "QUAY KHUAT / KHONG NHIN PHIA TRUOC"
-                            )
-                        else:
-                            cache["head_status"] = "DANG TIM MAT"
+                        # Missing face is ambiguous; do not invent head direction.
+                        cache["head_status"] = "DANG TIM MAT"
 
 
             # =================================================
             # VI TRI TU DONG - theo đúng Track ID
             # =================================================
-            auto_calibrated_now = update_auto_seat_anchor(
-                cache,
-                (x1, y1, x2, y2),
-                current_time
-            )
-
-            if auto_calibrated_now:
-                print(
-                    f"[AUTO VI TRI] Track ID {track_id}: da tu dong khoa vi tri chuan."
+            if not crowd_face_only:
+                auto_calibrated_now = update_auto_seat_anchor(
+                    cache,
+                    (x1, y1, x2, y2),
+                    current_time
                 )
 
-            anchor = cache.get("seat_anchor")
-
-            if anchor is not None:
-                calibrated_seat_count += 1
-
-                current_cx = (x1 + x2) / 2.0
-                current_bottom_y = float(y2)
-
-                dx_norm = abs(current_cx - anchor["cx"]) / max(anchor["w"], 1.0)
-                dy_norm = abs(current_bottom_y - anchor["bottom_y"]) / max(anchor["h"], 1.0)
-
-                cache["seat_dx_norm"] = dx_norm
-                cache["seat_dy_norm"] = dy_norm
-
-                if cache.get("seat_away", False):
-                    # Hysteresis: phải trở vào vùng nhỏ hơn mới reset.
-                    back_inside = (
-                        dx_norm <= SEAT_RETURN_X_RATIO
-                        and dy_norm <= SEAT_RETURN_Y_RATIO
+                if auto_calibrated_now:
+                    print(
+                        f"[AUTO VI TRI] Track ID {track_id}: da tu dong khoa vi tri chuan."
                     )
 
-                    if back_inside:
-                        cache["seat_away"] = False
-                        cache["seat_away_since"] = None
-                else:
-                    outside = (
-                        dx_norm >= SEAT_EXIT_X_RATIO
-                        or dy_norm >= SEAT_EXIT_Y_RATIO
-                    )
+                anchor = cache.get("seat_anchor")
 
-                    if outside:
-                        if cache.get("seat_away_since") is None:
-                            cache["seat_away_since"] = current_time
+                if anchor is not None:
+                    calibrated_seat_count += 1
 
-                        if (
-                            current_time - cache["seat_away_since"]
-                            >= SEAT_EXIT_SECONDS
-                        ):
-                            cache["seat_away"] = True
+                    current_cx = (x1 + x2) / 2.0
+                    current_bottom_y = float(y2)
+
+                    dx_norm = abs(current_cx - anchor["cx"]) / max(anchor["w"], 1.0)
+                    dy_norm = abs(current_bottom_y - anchor["bottom_y"]) / max(anchor["h"], 1.0)
+
+                    cache["seat_dx_norm"] = dx_norm
+                    cache["seat_dy_norm"] = dy_norm
+
+                    if cache.get("seat_away", False):
+                        # Hysteresis: phải trở vào vùng nhỏ hơn mới reset.
+                        back_inside = (
+                            dx_norm <= SEAT_RETURN_X_RATIO
+                            and dy_norm <= SEAT_RETURN_Y_RATIO
+                        )
+
+                        if back_inside:
+                            cache["seat_away"] = False
+                            cache["seat_away_since"] = None
                     else:
-                        cache["seat_away_since"] = None
-                        cache["seat_away"] = False
+                        outside = (
+                            dx_norm >= SEAT_EXIT_X_RATIO
+                            or dy_norm >= SEAT_EXIT_Y_RATIO
+                        )
+
+                        if outside:
+                            if cache.get("seat_away_since") is None:
+                                cache["seat_away_since"] = current_time
+
+                            if (
+                                current_time - cache["seat_away_since"]
+                                >= SEAT_EXIT_SECONDS
+                            ):
+                                cache["seat_away"] = True
+                        else:
+                            cache["seat_away_since"] = None
+                            cache["seat_away"] = False
+                else:
+                    cache["seat_away_since"] = None
+                    cache["seat_away"] = False
+
             else:
-                cache["seat_away_since"] = None
+                # FACE_ONLY never infers a seat or uses body movement.
                 cache["seat_away"] = False
+                cache["seat_away_since"] = None
 
             # =================================================
             # V13: FER + DAiSEE ENGAGEMENT CHAY NEN
@@ -2505,6 +2838,7 @@ try:
                     person_w >= AI_MIN_PERSON_WIDTH
                     and person_h >= AI_MIN_PERSON_HEIGHT
                     and not cache.get("ai_pending", False)
+                    and ready_for_face_ai(cache, current_time)
                 ):
                     try:
                         cache["ai_pending"] = True
@@ -2525,6 +2859,27 @@ try:
                     # Cho ID qua nho nghi mot nhip truoc khi thu lai.
                     if person_w < AI_MIN_PERSON_WIDTH or person_h < AI_MIN_PERSON_HEIGHT:
                         cache["ai_last_inference_time"] = float(current_time)
+
+            # In crowded scenes, a Track may not get a fresh face observation
+            # for several frames. Old face state must not accumulate alert time.
+            fresh_face = (
+                0 <= current_time - float(cache.get("face_last_observed_time", -1e9))
+                <= FACE_SIGNAL_FRESH_SECONDS
+            )
+            if not fresh_face:
+                cache["eye_status"] = "CHUA PHAN TICH"
+                cache["ear"] = None
+                cache["eye_closed_distinct_samples"] = 0
+                cache["head_status"] = "DANG TIM MAT"
+                cache["yaw"] = None
+                cache["pitch"] = None
+                cache["roll"] = None
+                cache["face_found"] = False
+                cache["face_bbox_norm"] = None
+                cache["face_bbox_time"] = -1e9
+            if crowd_face_only:
+                cache["seat_away"] = False
+                cache["body_status"] = "TU THE CHUA RO"
 
             ear = cache["ear"]
             eye_status = cache["eye_status"]
@@ -2628,10 +2983,10 @@ try:
             if fer_fresh or eng_fresh:
                 ai_ready_count += 1
 
-            if final_status == "DAU HIEU LO AU":
+            if final_status == "CAN CHU Y":
                 anxiety_count += 1
-                box_color = (180, 0, 180)
-                display_status = f"Dấu hiệu lo âu • {final_reason}"
+                box_color = (0, 165, 255)  # Head turn stays amber/yellow.
+                display_status = f"Cần chú ý • {final_reason}"
 
             elif final_status == "DAU HIEU MAT TAP TRUNG":
                 distracted_count += 1
@@ -2652,28 +3007,77 @@ try:
                 box_color = base_color
                 display_status = base_display
 
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                box_color,
-                2
+            # When 6+ people, the outline is a FACE DIRECTION indicator.
+            # Do not let a separate "THEO DOI" status paint a forward-facing
+            # face amber while its label says "Nhìn về camera".
+            face_eye_seconds = verified_observation_seconds(cache, "eye", current_time)
+            face_head_seconds = verified_observation_seconds(cache, "head", current_time)
+            direction_label, box_color, fer_label_line = face_direction_and_fer_labels(
+                head_status, cache.get("fer_label"), cache.get("fer_conf"), fer_fresh,
+                eye_status, face_eye_seconds, face_head_seconds,
             )
+            # Color is ALWAYS about visible face/eye behavior (green/yellow/red/gray).
+            # Fusion alerts remain separate and still reach Backend; no purple
+            # or red anxiety labels are painted over a forward-looking face.
+            if crowd_face_only:
+                display_status = direction_label
+            else:
+                display_status = direction_label
+                if body_status in RELIABLE_BODY_STATUSES:
+                    display_status += " • " + DISPLAY_TEXT.get(body_status, body_status)
+            crowd_direction = direction_label
+            crowd_fer = fer_label_line
 
-            person_labels.append(
-                (
-                    f"ID {track_id} • {display_status}",
-                    x1,
-                    max(24, y1 - 5),
-                    box_color,
-                )
-            )
+            # In FACE_ONLY mode draw ONLY reliable face rectangles, not body boxes.
+            display_box = (x1, y1, x2, y2)
+            if crowd_face_only:
+                norm = cache.get("face_bbox_norm")
+                if norm is None or not fresh_face:
+                    display_box = None
+                else:
+                    fx1, fy1, fx2, fy2 = norm
+                    face_coords = (
+                        max(0, min(frame.shape[1] - 1, x1 + int(fx1 * person_w))),
+                        max(0, min(frame.shape[0] - 1, y1 + int(fy1 * person_h))),
+                        max(0, min(frame.shape[1] - 1, x1 + int(fx2 * person_w))),
+                        max(0, min(frame.shape[0] - 1, y1 + int(fy2 * person_h))),
+                    )
+                    if (face_coords[2] - face_coords[0] >= 16
+                            and face_coords[3] - face_coords[1] >= 16):
+                        display_box = face_coords
+                    else:
+                        display_box = None
+
+            if display_box is not None:
+                bx1, by1, bx2, by2 = display_box
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), box_color, 2)
+                # Keep head-direction and FER separate, readable and honest.
+                # Crowd: line 1 is colored only by head direction; line 2
+                # shows FER if a fresh inference exists (else waiting).
+                person_labels.append((
+                    f"ID {track_id} • {crowd_direction}" if crowd_face_only
+                    else f"ID {track_id} • {display_status}",
+                    bx1, max(24, by1 - 5), box_color,
+                ))
+                if crowd_face_only:
+                    person_labels.append((
+                        crowd_fer, bx1, min(frame.shape[0] - 8, by2 + 24),
+                        (200, 200, 200),
+                    ))
+                else:
+                    # Small-group mode also shows FER status, even when the
+                    # asynchronous model hasn't produced a FRESH result yet.
+                    person_labels.append((
+                        fer_label_line, bx1, min(frame.shape[0] - 8, by1 + 28),
+                        (200, 200, 200),
+                    ))
 
 
             if (
-                track_id in analyze_ids
-                and
-                cache["face_found"]
+                SHOW_DEBUG_EYE_LANDMARKS
+                and track_id in analyze_ids
+                and not crowd_face_only
+                and cache["face_found"]
             ):
 
                 for px, py in (
@@ -2727,8 +3131,8 @@ try:
             (
                 f"Người: {len(detections)}  |  "
                 f"Mặt: {face_count}  |  "
-                f"Tư thế: {body_count}  |  "
-                f"Đã tự học chỗ: {calibrated_seat_count}"
+                f"Tư thế rõ: {body_count}  |  "
+                f"Chế độ: {'MẶT (>5)' if crowd_face_only else 'ĐẦY ĐỦ (≤5)'}"
             ),
             (
                 f"Lệch hướng: {head_not_forward_count}  |  "
@@ -2736,23 +3140,31 @@ try:
                 f"Rời chỗ: {seat_away_count}  |  "
                 f"AI: {ai_ready_count}  |  "
                 f"Mất tập trung: {distracted_count}  |  "
-                f"Lo âu: {anxiety_count}  |  "
+                f"Cần chú ý: {anxiety_count}  |  "
                 f"FPS: {fps_smooth:.1f}"
             ),
         ]
 
         # Han che cac nhan 1 dong bi de len nhau khi nhieu hoc sinh dung gan nhau.
-        person_labels.sort(key=lambda item: item[2])
+        person_labels.sort(key=lambda item: (item[2], item[1]))
         adjusted_labels = []
-        last_y = -999
-
+        # Keep labels near each face; DO NOT stack all seven across same column.
+        # Move a label only if its horizontal span overlaps another label.
+        occupied = []
         for text_label, lx, ly, lcolor in person_labels:
-            adjusted_y = ly
-            if adjusted_y - last_y < 24:
-                adjusted_y = last_y + 24
-            adjusted_y = min(adjusted_y, frame.shape[0] - 8)
+            width_estimate = min(frame.shape[1] - 6, max(110, len(text_label) * 9))
+            adjusted_y = min(max(24, ly), frame.shape[0] - 8)
+            for _ in range(12):
+                conflict = any(
+                    abs(adjusted_y - oy) < 22
+                    and lx < ox + ow and ox < lx + width_estimate
+                    for ox, oy, ow in occupied
+                )
+                if not conflict:
+                    break
+                adjusted_y = min(frame.shape[0] - 8, adjusted_y + 23)
             adjusted_labels.append((text_label, lx, adjusted_y, lcolor))
-            last_y = adjusted_y
+            occupied.append((lx, adjusted_y, width_estimate))
 
         frame = draw_unicode_labels(
             frame,

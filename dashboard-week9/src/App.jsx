@@ -1,8 +1,10 @@
 import { Component, useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./index.css";
+import { StatsAnalyticsCharts, TodayOverviewChart } from "./AiAnalyticsCharts"; // WEEK9_AI_ANALYTICS_V1
 import ProtectedMedia from "./ProtectedMedia";
 import CameraRecordings from "./CameraRecordings";
+import RealGradcamPage from "./RealGradcamPage";
 
 const API = "http://localhost:3001";
 const HISTORY_PAGE_SIZE = 200;
@@ -79,6 +81,23 @@ function App() {
   });
 
   const [activePage, setActivePage] = useState("overview");
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem("dashboard-theme") === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try {
+      localStorage.setItem("dashboard-theme", theme);
+    } catch {
+      // Keep the in-memory setting if browser storage is unavailable.
+    }
+  }, [theme]);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -130,6 +149,8 @@ function App() {
   );
   const [trendPreset, setTrendPreset] = useState("30");
   const [trends, setTrends] = useState([]);
+  const [todayHourly, setTodayHourly] = useState(null);
+  const [todayHourlyError, setTodayHourlyError] = useState("");
 
   const [health, setHealth] = useState({
     backend: false,
@@ -181,7 +202,8 @@ function App() {
     return allAlerts.filter((item) => {
       const typeOk =
         alertFilter === "all"
-        || item.alert_type === alertFilter;
+        || item.alert_type === alertFilter
+        || (alertFilter === "can_chu_y" && item.alert_type === "dau_hieu_lo_au");
 
       const classOk =
         !alertClassId
@@ -314,8 +336,8 @@ function App() {
       return "Mất tập trung";
     }
 
-    if (type === "dau_hieu_lo_au") {
-      return "Dấu hiệu cần quan sát thêm";
+    if (type === "can_chu_y" || type === "dau_hieu_lo_au") {
+      return "Cần chú ý";
     }
 
     return type || "Cảnh báo";
@@ -330,8 +352,8 @@ function App() {
       return "Mất tập trung";
     }
 
-    if (value === "DAU HIEU LO AU") {
-      return "Dấu hiệu cần quan sát thêm";
+    if (value === "CAN CHU Y" || value === "DAU HIEU LO AU") {
+      return "Cần chú ý";
     }
 
     if (value === "BINH THUONG") {
@@ -350,7 +372,7 @@ function App() {
       .replaceAll("_", " ")
       .toUpperCase();
 
-    if (value.includes("LO AU")) {
+    if (value.includes("LO AU") || value.includes("CAN CHU Y")) {
       return "badge anxiety";
     }
 
@@ -556,6 +578,17 @@ function App() {
     setStudents(data);
   };
 
+  // Read-only refresh: these endpoints SELECT data from PostgreSQL.
+  // Never create sample students/classes on page load or refresh.
+  const reloadRosterFromDatabase = async () => {
+    try {
+      await Promise.all([loadClasses(), loadStudents()]);
+      showToast("Đã tải lại lớp học và học sinh từ PostgreSQL.");
+    } catch (error) {
+      setErrorText(error.message || "Không thể tải dữ liệu PostgreSQL.");
+    }
+  };
+
   const loadGradcam = async () => {
     const data = await apiJson(
       "/api/gradcam/examples",
@@ -658,7 +691,7 @@ function App() {
     setStudentReport(data);
   };
 
-  const applyTrendPreset = (preset) => {
+  const applyTrendPreset = async (preset) => {
     const today = new Date();
     let from = new Date(today);
     let to = new Date(today);
@@ -694,40 +727,29 @@ function App() {
     }
 
     if (preset === "all") {
-      const alertDates = allAlerts
-        .filter(
-          (item) =>
-            (
-              !statsClassId
-              || String(item.class_id) === String(statsClassId)
-            )
-            && (
-              !statsSessionId
-              || String(item.session_id) === String(statsSessionId)
-            )
-            && (
-              !statsStudentId
-              || String(item.student_id) === String(statsStudentId)
-            )
-            && (
-              !statsStudentId
-              || item.video_id
-            )
-        )
-        .map((item) => new Date(item.created_at))
-        .filter(
-          (date) =>
-            !Number.isNaN(date.getTime())
+      // The earliest date comes from PostgreSQL, not the limited alert list on the page.
+      try {
+        const boundsParams = new URLSearchParams();
+        if (statsClassId) boundsParams.set("classId", statsClassId);
+        if (statsSessionId) boundsParams.set("sessionId", statsSessionId);
+        if (statsStudentId) {
+          boundsParams.set("studentId", statsStudentId);
+          boundsParams.set("videoOnly", "1");
+        }
+        const bounds = await apiJson(
+          `/api/stats/date-bounds?${boundsParams.toString()}`,
+          { headers: authHeaders }
         );
-
-      if (alertDates.length > 0) {
-        from = new Date(
-          Math.min(
-            ...alertDates.map(
-              (date) => date.getTime()
-            )
-          )
-        );
+        if (bounds?.from) {
+          from = new Date(`${bounds.from}T12:00:00`);
+        } else {
+          // Keep the established 30-day behavior if no matching alert exists.
+          from.setDate(from.getDate() - 29);
+        }
+        if (bounds?.to) to = new Date(`${bounds.to}T12:00:00`);
+      } catch (error) {
+        setErrorText(`Không thể tải khoảng thống kê từ Database: ${error.message || error}`);
+        return;
       }
     }
 
@@ -1115,6 +1137,28 @@ function App() {
     statsStudentId,
     token,
   ]);
+
+  // WEEK9_AI_ANALYTICS_V1: hourly counts come from the full authorized database,
+  // never from allAlerts (which is intentionally capped for the UI).
+  useEffect(() => {
+    if (!token || activePage !== "overview") return undefined;
+    let cancelled = false;
+    const loadTodayHourly = async () => {
+      try {
+        const next = await apiJson("/api/stats/today-hourly", {headers:authHeaders});
+        if (!cancelled) {
+          setTodayHourly(next);
+          setTodayHourlyError("");
+        }
+      } catch (error) {
+        if (!cancelled) setTodayHourlyError(error?.message || "Không tải được dữ liệu.");
+      }
+    };
+    loadTodayHourly();
+    const intervalId = setInterval(loadTodayHourly, 90000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, activePage, authHeaders]);
 
   const changeCameraClass = async (classId) => {
     if (!classId) {
@@ -2290,9 +2334,9 @@ function App() {
           </h1>
 
           <p className="subtitle">
-            Hệ thống hỗ trợ phát hiện
-            dấu hiệu lo âu và mất tập
-            trung qua camera.
+            Hệ thống hỗ trợ theo dõi
+            tình huống cần chú ý và mức độ
+            tập trung qua camera.
           </p>
 
           <label>Email</label>
@@ -2406,6 +2450,19 @@ function App() {
       </aside>
 
       <main className="dashboard-main">
+        <div className="app-topbar">
+          <button
+            className="theme-toggle"
+            type="button"
+            onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+            aria-label={`Chuyển sang giao diện ${theme === "dark" ? "sáng" : "tối"}`}
+            aria-pressed={theme === "dark"}
+          >
+            <span className="theme-toggle-icon" aria-hidden="true">{theme === "dark" ? "☾" : "☀"}</span>
+            <span className="theme-toggle-label">{theme === "dark" ? "Tối" : "Sáng"}</span>
+            <span className="theme-toggle-track" aria-hidden="true"><span /></span>
+          </button>
+        </div>
         {toast && (
           <div className="toast">
             {toast}
@@ -2429,6 +2486,9 @@ function App() {
         {activePage === "overview" && (
           <OverviewPage
             stats={stats}
+            todayHourly={todayHourly}
+            todayHourlyError={todayHourlyError}
+            trends={trends}
             recentAlerts={recentAlerts}
             health={health}
             cameraOnline={cameraOnline}
@@ -2472,6 +2532,7 @@ function App() {
             onAdd={addClass}
             onEdit={editClass}
             onDelete={deleteClass}
+            onReloadFromDb={reloadRosterFromDatabase}
           />
         )}
 
@@ -2500,6 +2561,7 @@ function App() {
             onAdd={addStudent}
             onEdit={editStudent}
             onDelete={deleteStudent}
+            onReloadFromDb={reloadRosterFromDatabase}
           />
         )}
 
@@ -2589,9 +2651,9 @@ function App() {
 
         {activePage === "gradcam" && (
           <GradcamPage
-            examples={
-              gradcamExamples
-            }
+            examples={gradcamExamples}
+            videos={videos}
+            token={token}
           />
         )}
 
@@ -2694,11 +2756,14 @@ function PageHeader({
 
 function OverviewPage({
   stats,
+  trends,
   recentAlerts,
   health,
   cameraOnline,
   formatAlertType,
   onViewAll,
+  todayHourly,
+  todayHourlyError,
 }) {
   return (
     <>
@@ -2742,12 +2807,14 @@ function OverviewPage({
         />
 
         <StatCard
-          label="Dấu hiệu lo âu"
+          label="Cần chú ý"
           value={stats.anxiety}
           note="Đang được theo dõi"
           className="anxiety-card"
         />
       </section>
+
+      <OverviewTrendChart trends={trends} />
 
       <section className="dashboard-section">
         <div className="section-header">
@@ -2786,6 +2853,8 @@ function OverviewPage({
         </div>
       </section>
 
+      <TodayOverviewChart hourly={todayHourly} error={todayHourlyError} />
+
       <section className="bottom-grid">
         <div className="bottom-card">
           <div className="bottom-card-header">
@@ -2810,7 +2879,7 @@ function OverviewPage({
           {recentAlerts.length === 0 ? (
             <EmptyState
               title="Chưa có cảnh báo mới"
-              text="Cảnh báo mất tập trung hoặc dấu hiệu lo âu sẽ xuất hiện tại đây."
+              text="Cảnh báo mất tập trung hoặc tình huống cần chú ý sẽ xuất hiện tại đây."
             />
           ) : (
             <div className="recent-alert-list">
@@ -2875,6 +2944,197 @@ function OverviewPage({
         </div>
       </section>
     </>
+  );
+}
+
+// WEEK9_OVERVIEW_TREND_NUMBERS_V2
+// Daily numbers are read from the already-authorized /api/stats/trends response.
+// We never infer labels from video frames or alter the backend statistics.
+function OverviewTrendChart({ trends = [] }) {
+  const [selectedDay, setSelectedDay] = useState("");
+  const [hoveredDay, setHoveredDay] = useState("");
+  const [showAllDays, setShowAllDays] = useState(false);
+  const [expandSmallDays, setExpandSmallDays] = useState(false);
+  const rows = useMemo(() => (Array.isArray(trends) ? trends : [])
+    .filter((row) => /^\d{4}-\d{2}-\d{2}/.test(String(row?.day ?? "")))
+    .slice(-30)
+    .map((row) => {
+      const distracted = Math.max(0, Number(row.distracted) || 0);
+      const anxiety = Math.max(0, Number(row.anxiety) || 0);
+      const total = Math.max(0, Number(row.total) || 0);
+      return {
+        day: String(row.day).slice(0, 10),
+        distracted, anxiety,
+        // Total comes from PostgreSQL; never silently replace it with chart sums.
+        total,
+        other: Math.max(0, total - distracted - anxiety),
+      };
+    }), [trends]);
+  const number = (value) => Number(value || 0).toLocaleString("vi-VN");
+  const dateLabel = (day) => {
+    const parts = String(day || "").slice(0, 10).split("-");
+    return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : day;
+  };
+  const shortDate = (day) => dateLabel(day).slice(0, 5);
+  const aggregate = rows.reduce((sum, row) => ({
+    total: sum.total + row.total,
+    distracted: sum.distracted + row.distracted,
+    anxiety: sum.anxiety + row.anxiety,
+  }), { total: 0, distracted: 0, anxiety: 0 });
+  const mostAlerts = rows.reduce((best, row) => (!best || row.total > best.total ? row : best), null);
+  const active = rows.find((row) => row.day === hoveredDay)
+    || rows.find((row) => row.day === selectedDay)
+    || mostAlerts || rows[rows.length - 1] || null;
+
+  const chartWidth = 960;
+  const chartHeight = 275;
+  const left = 54;
+  const right = 20;
+  const top = 23;
+  const baseline = 229;
+  const innerWidth = chartWidth - left - right;
+  const innerHeight = baseline - top;
+  const peak = Math.max(1, ...rows.map((row) => Math.max(row.distracted, row.anxiety)));
+  const xFor = (index) => rows.length <= 1
+    ? left + innerWidth / 2
+    : left + index * innerWidth / (rows.length - 1);
+  // Optional log scale is EXPLICITLY labeled. It only changes coordinates, not counts.
+  const fractionFor = (value) => expandSmallDays
+    ? Math.log1p(Math.max(0, Number(value) || 0)) / Math.log1p(peak)
+    : Math.max(0, Number(value) || 0) / peak;
+  const yFor = (value) => baseline - innerHeight * fractionFor(value);
+  const scaleValue = (fraction) => expandSmallDays
+    ? Math.round(Math.expm1(Math.log1p(peak) * fraction))
+    : Math.round(peak * fraction);
+  const makePath = (key) => rows.map((row, index) =>
+    `${index === 0 ? "M" : "L"} ${xFor(index).toFixed(1)} ${yFor(row[key]).toFixed(1)}`
+  ).join(" ");
+  const activeIndex = active ? rows.findIndex((row) => row.day === active.day) : -1;
+  const labelIndexes = rows.length > 1
+    ? [...new Set([0, Math.floor((rows.length - 1) / 2), rows.length - 1])]
+    : rows.length ? [0] : [];
+  const visibleRows = showAllDays ? [...rows].reverse() : rows.slice(-7).reverse();
+  const canExpand = rows.length > 7;
+
+  return (
+    <section className="dashboard-section overview-trend-card">
+      <div className="section-header overview-trend-header">
+        <div>
+          <span className="eyebrow">{rows.length} NGÀY ĐƯỢC THỐNG KÊ</span>
+          <h2>Xu hướng cảnh báo</h2>
+          <p>Chọn một ngày trên biểu đồ để xem số liệu chính xác từ PostgreSQL.</p>
+        </div>
+        <div className="trend-legend" aria-label="Chú giải biểu đồ">
+          <span><i className="legend-dot distracted" />Mất tập trung</span>
+          <span><i className="legend-dot anxiety" />Cần chú ý</span>
+        </div>
+      </div>
+      {rows.length === 0 ? (
+        <div className="overview-chart-empty" role="status">
+          <span className="chart-empty-icon" aria-hidden="true">⌁</span>
+          <strong>Chưa có dữ liệu xu hướng</strong>
+          <span>Biểu đồ sẽ cập nhật khi hệ thống ghi nhận cảnh báo.</span>
+        </div>
+      ) : (
+        <>
+          <div className="ov-numbers-overview" aria-label="Tóm tắt cảnh báo theo thời gian">
+            <div><span>Tổng số cảnh báo</span><strong>{number(aggregate.total)}</strong></div>
+            <div><span>Mất tập trung</span><strong>{number(aggregate.distracted)}</strong></div>
+            <div><span>Cần chú ý</span><strong>{number(aggregate.anxiety)}</strong></div>
+            <div><span>Ngày có nhiều cảnh báo nhất</span><strong>{mostAlerts ? `${shortDate(mostAlerts.day)} · ${number(mostAlerts.total)}` : "—"}</strong></div>
+          </div>
+          <div className="ov-numbers-toolbar">
+            <span>Đường xanh/tím: số cảnh báo của từng loại theo ngày</span>
+            <label className="ov-numbers-scale">
+              <input type="checkbox" checked={expandSmallDays} onChange={(event) => setExpandSmallDays(event.target.checked)} />
+              Làm rõ ngày ít cảnh báo
+            </label>
+          </div>
+          {expandSmallDays && <p className="ov-numbers-scale-note">Trục đứng được nén theo thang log để nhìn rõ những ngày có ít cảnh báo; số liệu trong bảng vẫn giữ nguyên.</p>}
+          <div className="overview-chart-wrap ov-numbers-chart-wrap">
+            <svg className="overview-chart" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label="Xu hướng cảnh báo; chọn ngày để xem chính xác số cảnh báo">
+              <defs>
+                <linearGradient id="trendFillCyan" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#22d3ee" stopOpacity=".22" />
+                  <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              {[0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+                const y = baseline - innerHeight * fraction;
+                return (
+                  <g key={fraction}>
+                    <line className="chart-gridline" x1={left} x2={chartWidth - right} y1={y} y2={y} />
+                    <text className="chart-axis-label" x={left - 9} y={y + 4} textAnchor="end">{number(scaleValue(fraction))}</text>
+                  </g>
+                );
+              })}
+              {rows.length > 1 && <path
+                d={`${makePath("distracted")} L ${xFor(rows.length - 1)} ${baseline} L ${xFor(0)} ${baseline} Z`}
+                fill="url(#trendFillCyan)"
+              />}
+              <path className="chart-line chart-line-distracted" d={makePath("distracted")} />
+              <path className="chart-line chart-line-anxiety" d={makePath("anxiety")} />
+              {rows.map((row, index) => (
+                <g key={row.day}>
+                  <circle className="chart-point chart-point-distracted" cx={xFor(index)} cy={yFor(row.distracted)} r={activeIndex === index ? 5.3 : 2.7} />
+                  <circle className="chart-point chart-point-anxiety" cx={xFor(index)} cy={yFor(row.anxiety)} r={activeIndex === index ? 5.3 : 2.7} />
+                </g>
+              ))}
+              {activeIndex >= 0 && (
+                <g pointerEvents="none">
+                  <line x1={xFor(activeIndex)} x2={xFor(activeIndex)} y1={top} y2={baseline} stroke="var(--accent)" strokeWidth="1.2" strokeDasharray="4 5" />
+                  <circle cx={xFor(activeIndex)} cy={yFor(active.distracted)} r="6.7" fill="#31d7e8" stroke="var(--surface)" strokeWidth="2.3" />
+                </g>
+              )}
+              {labelIndexes.map((index) => (
+                <text className="chart-axis-label" key={rows[index].day} x={xFor(index)} y={chartHeight - 16} textAnchor={index === 0 ? "start" : index === rows.length - 1 ? "end" : "middle"}>
+                  {shortDate(rows[index].day)}
+                </text>
+              ))}
+              {rows.map((row, index) => {
+                const hitWidth = rows.length === 1 ? 50 : innerWidth / (rows.length - 1);
+                return <rect key={`select-${row.day}`} x={xFor(index) - hitWidth / 2} y={top} width={hitWidth} height={baseline - top}
+                  fill="transparent" role="button" tabIndex={0}
+                  aria-label={`${dateLabel(row.day)}: ${number(row.total)} cảnh báo, ${number(row.distracted)} mất tập trung, ${number(row.anxiety)} cần chú ý`}
+                  onPointerEnter={() => setHoveredDay(row.day)}
+                  onPointerLeave={() => setHoveredDay("")}
+                  onFocus={() => setHoveredDay(row.day)}
+                  onBlur={() => setHoveredDay("")}
+                  onClick={() => setSelectedDay(row.day)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedDay(row.day); }
+                  }}
+                />;
+              })}
+            </svg>
+          </div>
+          <div className="ov-numbers-selected" aria-live="polite">
+            <div className="ov-numbers-selected-heading"><span>Đang xem ngày</span><strong>{dateLabel(active?.day)}</strong></div>
+            <div><span>Tổng cảnh báo</span><strong>{number(active?.total)}</strong></div>
+            <div><span className="ov-numbers-dot cyan" />Mất tập trung<strong>{number(active?.distracted)}</strong></div>
+            <div><span className="ov-numbers-dot violet" />Cần chú ý<strong>{number(active?.anxiety)}</strong></div>
+            {(active?.other ?? 0) > 0 && <div><span>Loại khác</span><strong>{number(active.other)}</strong></div>}
+          </div>
+          <div className="ov-numbers-days-head">
+            <div><h3>Số liệu chi tiết từng ngày</h3><p>Nhấn vào một dòng để chọn ngày trên biểu đồ.</p></div>
+            {canExpand && <button type="button" className="ov-numbers-toggle" onClick={() => setShowAllDays((previous) => !previous)}>
+              {showAllDays ? "Thu gọn còn 7 ngày" : `Xem đủ ${rows.length} ngày`}
+            </button>}
+          </div>
+          <div className="ov-numbers-table-scroll">
+            <table className="ov-numbers-table">
+              <thead><tr><th>Ngày</th><th>Mất tập trung</th><th>Cần chú ý</th><th>Tổng cảnh báo</th></tr></thead>
+              <tbody>{visibleRows.map((row) => (
+                <tr key={row.day} className={active?.day === row.day ? "is-active" : ""}>
+                  <td><button type="button" onClick={() => {setSelectedDay(row.day); setHoveredDay("");}} aria-label={`Chọn ngày ${dateLabel(row.day)}`}>{dateLabel(row.day)}</button></td>
+                  <td>{number(row.distracted)}</td><td>{number(row.anxiety)}</td><td><strong>{number(row.total)}</strong></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -3177,6 +3437,7 @@ function ClassesPage({
   onAdd,
   onEdit,
   onDelete,
+  onReloadFromDb,
 }) {
   return (
     <>
@@ -3196,6 +3457,10 @@ function ClassesPage({
       />
 
       <section className="dashboard-section">
+        <div className="db-source-note">
+          <span>Danh sách đang tải từ <strong>PostgreSQL / classes</strong> qua Backend (không viết sẵn trong React).</span>
+          <button type="button" className="secondary-button" onClick={onReloadFromDb}>Tải lại từ Database</button>
+        </div>
         {classes.length === 0 ? (
           <EmptyState
             title="Chưa có lớp học"
@@ -3262,6 +3527,7 @@ function StudentsPage({
   onAdd,
   onEdit,
   onDelete,
+  onReloadFromDb,
 }) {
   const visible = selectedClassId
     ? students.filter(
@@ -3295,6 +3561,10 @@ function StudentsPage({
       />
 
       <section className="dashboard-section">
+        <div className="db-source-note">
+          <span>Danh sách đang tải từ <strong>PostgreSQL / students</strong> qua Backend; mã học sinh liên kết tới lớp bằng <strong>class_id</strong>.</span>
+          <button type="button" className="secondary-button" onClick={onReloadFromDb}>Tải lại từ Database</button>
+        </div>
         <div className="toolbar">
           <label>
             Lọc theo lớp
@@ -3735,20 +4005,27 @@ function AlertsPage({
             <button
               className={
                 alertFilter ===
-                "dau_hieu_lo_au"
+                "can_chu_y"
                   ? "filter-active"
                   : ""
               }
               onClick={() =>
                 setAlertFilter(
-                  "dau_hieu_lo_au"
+                  "can_chu_y"
                 )
               }
             >
-              Dấu hiệu lo âu
+              Cần chú ý
             </button>
           </div>
         </div>
+
+        {/* WEEK9_CONSISTENT_AUTO_NAMES_V1: disclosure only once, not after each name. */}
+        {alerts.some((row) => row.assignment_kind === "demo_unverified") && (
+          <p className="muted-small" style={{ margin: "10px 0" }}>
+            Tên được ghép tự động theo Track từ danh sách lớp, không phải kết quả xác minh danh tính trong video.
+          </p>
+        )}
 
         {alerts.length === 0 ? (
           <EmptyState
@@ -3787,8 +4064,7 @@ function AlertRow({
     <div className="recent-alert-item alert-rich-row">
       <div
         className={
-          alert.alert_type ===
-          "dau_hieu_lo_au"
+          ["can_chu_y", "dau_hieu_lo_au"].includes(alert.alert_type)
             ? "alert-dot anxiety-dot"
             : "alert-dot distracted-dot"
         }
@@ -3990,6 +4266,13 @@ function HistoryPage({
             }
           />
         </div>
+
+        {/* WEEK9_CONSISTENT_AUTO_NAMES_V1: same disclosure on AI history. */}
+        {rows.some((row) => row.assignment_kind === "demo_unverified") && (
+          <p className="muted-small" style={{ margin: "10px 0" }}>
+            Tên được ghép tự động theo Track từ danh sách lớp, không phải kết quả xác minh danh tính trong video.
+          </p>
+        )}
 
         {loading && rows.length === 0 ? (
           <EmptyState
@@ -4422,7 +4705,7 @@ function StatsPage({
           className="warning-card"
         />
         <StatCard
-          label="Dấu hiệu lo âu"
+          label="Cần chú ý"
           value={anxietyAlerts}
           note="Trong khoảng đang chọn"
           className="anxiety-card"
@@ -4433,6 +4716,8 @@ function StatsPage({
           note={`${trends.length} ngày được thống kê`}
         />
       </section>
+
+      <StatsAnalyticsCharts trends={trends} />
 
       {studentId && (
         <section className="dashboard-section student-detail-report">
@@ -4499,7 +4784,7 @@ function StatsPage({
                       <th>Bản ghi AI</th>
                       <th>Cảnh báo</th>
                       <th>Mất tập trung</th>
-                      <th>Dấu hiệu lo âu</th>
+                      <th>Cần chú ý</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4582,7 +4867,7 @@ function StatsPage({
                 </strong>
 
                 <small>
-                  MT: {item.distracted} • LA: {item.anxiety}
+                  MT: {item.distracted} • CCY: {item.anxiety}
                 </small>
               </div>
             ))}
@@ -4595,6 +4880,8 @@ function StatsPage({
 
 function GradcamPage({
   examples,
+  videos,
+  token,
 }) {
   return (
     <>
@@ -4603,7 +4890,9 @@ function GradcamPage({
         subtitle="Giải thích vùng ảnh ảnh hưởng đến dự đoán FER"
       />
 
+      <RealGradcamPage videos={videos} token={token} />
       <section className="dashboard-section">
+        <h2>Ví dụ FER2013 — không phải kết quả video thực tế</h2>
         <p className="info-note">
           Heatmap chỉ hỗ trợ giải thích
           vùng ảnh ảnh hưởng tới dự đoán
